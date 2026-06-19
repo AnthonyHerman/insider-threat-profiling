@@ -494,4 +494,151 @@ mod tests {
             "agent should alert, got {after}"
         );
     }
+
+    /// Helper: the single Score event a `handle()` call emitted, or panic. The
+    /// scoring plugin emits at most one Score per processed event.
+    fn sole_score(events: &[Event]) -> (&str, f64, &BTreeMap<String, f64>) {
+        let scores: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Score {
+                    subject,
+                    score,
+                    features,
+                    ..
+                } => Some((subject.as_str(), *score, features)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scores.len(), 1, "expected exactly one Score event");
+        scores[0]
+    }
+
+    /// A `ProcessExec` for a benign exe adds `process_weight` of risk under the
+    /// `uid:<N>` subject and emits a matching Score (delta == process_weight).
+    #[tokio::test]
+    async fn process_exec_benign_scores_process_weight() {
+        let emitter = Arc::new(CapturingEmitter::default());
+        let ctx = test_ctx(emitter.clone());
+        let plugin = ScoringPlugin::default();
+        let cfg = ScoringConfig::default();
+
+        plugin
+            .handle(
+                &Event::new(
+                    "test-agent",
+                    "test",
+                    EventPayload::ProcessExec {
+                        pid: 100,
+                        ppid: 1,
+                        uid: 1000,
+                        exe: "/usr/bin/ls".into(),
+                        cmdline: vec![],
+                        cwd: None,
+                    },
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let events = emitter.events.lock().unwrap();
+        let (subject, score, features) = sole_score(&events);
+        assert_eq!(subject, "uid:1000", "process risk is keyed by uid");
+        assert_eq!(score, cfg.process_weight);
+        assert_eq!(features.get("delta").copied(), Some(cfg.process_weight));
+        // ProcessExec is not detection-sourced: no verdict decomposition.
+        assert!(!features.contains_key("verdict_agentness"));
+    }
+
+    /// A suspicious exe (on the watch-list) scores `process_weight * 3`.
+    #[tokio::test]
+    async fn process_exec_suspicious_scores_triple() {
+        let emitter = Arc::new(CapturingEmitter::default());
+        let ctx = test_ctx(emitter.clone());
+        let plugin = ScoringPlugin::default();
+        let cfg = ScoringConfig::default();
+
+        plugin
+            .handle(
+                &Event::new(
+                    "test-agent",
+                    "test",
+                    EventPayload::ProcessExec {
+                        pid: 200,
+                        ppid: 1,
+                        uid: 1000,
+                        exe: "nc".into(),
+                        cmdline: vec![],
+                        cwd: None,
+                    },
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let events = emitter.events.lock().unwrap();
+        let (subject, score, _features) = sole_score(&events);
+        assert_eq!(subject, "uid:1000");
+        assert_eq!(score, cfg.process_weight * 3.0);
+    }
+
+    /// Enough suspicious `ProcessExec` events for one uid cross the alert
+    /// threshold and emit an Alert naming that subject — proving the
+    /// ProcessExec → score → alert chain through the async `handle()`.
+    #[tokio::test]
+    async fn process_exec_flood_crosses_alert_threshold() {
+        let emitter = Arc::new(CapturingEmitter::default());
+        let ctx = test_ctx(emitter.clone());
+        let plugin = ScoringPlugin::default();
+        let cfg = ScoringConfig::default();
+
+        // Each suspicious exec adds 15 (5 * 3); with decay 0.98 the score climbs
+        // past 75 well within this many distinct PIDs for the same uid.
+        for pid in 0u32..40 {
+            plugin
+                .handle(
+                    &Event::new(
+                        "test-agent",
+                        "test",
+                        EventPayload::ProcessExec {
+                            pid,
+                            ppid: 1,
+                            uid: 1000,
+                            exe: "socat".into(),
+                            cmdline: vec![],
+                            cwd: None,
+                        },
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+        }
+
+        let events = emitter.events.lock().unwrap();
+        let alert = events.iter().find_map(|e| match &e.payload {
+            EventPayload::Alert {
+                subject: Some(s),
+                severity,
+                ..
+            } => Some((s.clone(), *severity)),
+            _ => None,
+        });
+        let (subject, _sev) = alert.expect("a sustained suspicious-exec flood should alert");
+        assert_eq!(subject, "uid:1000");
+        // And the score that triggered it must be at/above the threshold.
+        let max_score = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Score { score, .. } => Some(*score),
+                _ => None,
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_score >= cfg.alert_threshold,
+            "expected risk to reach the alert threshold, got {max_score}"
+        );
+    }
 }

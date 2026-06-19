@@ -47,10 +47,14 @@ violates one of them will be sent back regardless of how well it is written.
 - Rust, pinned by [`rust-toolchain.toml`](rust-toolchain.toml) to **1.92.0**
   with the `rustfmt` and `clippy` components. `rustup` will install the pinned
   toolchain automatically when you build in the repo.
+- A C compiler (gcc or clang). `ring` (via `rustls`) compiles a small
+  C/assembly component with the `cc` crate, so a C toolchain is needed even for
+  the default `gnu` build. On Debian/Ubuntu: `apt install build-essential`.
 - For the static server build: the musl target
   (`rustup target add x86_64-unknown-linux-musl`, also declared in the toolchain
-  file) and a C toolchain that targets musl for `ring` (CI installs
-  `musl-tools`, which provides `musl-gcc`).
+  file) and a musl-targeting C toolchain for `ring` (CI installs `musl-tools`,
+  which provides `musl-gcc`). The committed `.cargo/config.toml` pins the musl
+  linker to `musl-gcc`, so the build works after `apt install musl-tools`.
 
 ## Build, test, lint, format
 
@@ -100,8 +104,15 @@ two jobs; **both must be green** to merge.
    - `cargo build --workspace --locked` — must build with the committed
      `Cargo.lock` (no implicit dependency updates).
    - `cargo test --workspace --locked` — the whole test suite must pass.
-2. **`self-contained server (static musl)`** (the `static-server` job): builds
-   the server as a fully static binary and *verifies* it is self-contained.
+   - **Eval reproducibility** — regenerates `docs/paper/results.md` from the
+     seeded `eval_report` example and **fails on any diff**, so the table the
+     paper quotes "verbatim" cannot silently drift from the model/feature code.
+     If you change the model, weights, thresholds, or synth parameters,
+     regenerate it: `cargo run --release -p plugin-agent-detect --example eval_report > docs/paper/results.md`.
+2. **`self-contained server (static musl)`** (the `static-server` job): runs only
+   after the `test` job passes (`needs: [test]`), so a broken test suite blocks
+   the slow musl build and the artifact upload. It builds the server as a fully
+   static binary and *verifies* it is self-contained.
    - `cargo build --release --bin aegisd --target x86_64-unknown-linux-musl --locked`
    - The job then runs `ldd` on the resulting `aegisd` and **fails** unless the
      binary reports "statically linked" / "not a dynamic executable", then

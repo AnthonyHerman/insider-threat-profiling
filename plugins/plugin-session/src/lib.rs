@@ -17,7 +17,7 @@
 
 use aegis_sdk::{
     register_plugin, Event, EventPayload, Plugin, PluginContext, PluginKind, PluginMetadata,
-    Subscriptions,
+    Severity, Subscriptions,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -31,13 +31,62 @@ pub struct SessionConfig {
     pub hash_salt: String,
 }
 
+/// Generate an opaque, unguessable session identifier (random UUIDv4).
+///
+/// Earlier builds used a `"{user}:{pid}"` shape, which any process that can read
+/// `/proc` could enumerate and then forge `Keystroke`/`CommandObserved` events
+/// for a victim's live session (THREAT_MODEL §4.2 A6). A random UUID closes that:
+/// the identity is non-enumerable, so an attacker cannot target a specific
+/// subject's accumulator. The human-readable `user`/`tty` still travel on
+/// `SessionStart` for display/correlation.
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// The shipped placeholder salt. A deployment that leaves this unchanged gets a
+/// *publicly known* salt, so its command-correlation hashes are linkable by
+/// anyone (THREAT_MODEL §7 guardrail 5: salt secrecy gates de-anonymization).
+/// We refuse to silently run with it (see [`warn_on_default_salt`]).
+pub const DEFAULT_SALT: &str = "aegis-default-salt";
+
 impl Default for SessionConfig {
     fn default() -> Self {
         SessionConfig {
             emit_current_login: true,
-            hash_salt: "aegis-default-salt".to_string(),
+            hash_salt: DEFAULT_SALT.to_string(),
         }
     }
+}
+
+/// Surface a loud warning *and* a `High` alert when a collector is running with
+/// the public default salt, converting the example-config advisory ("CHANGE ME")
+/// into an enforced, observable posture signal. Returns whether the default was
+/// in use (for tests). The alert rides the bus to the server like any other, so
+/// an operator sees that cross-session correlation is de-anonymizable.
+pub async fn warn_on_default_salt(salt: &str, plugin: &str, ctx: &PluginContext) -> bool {
+    if salt != DEFAULT_SALT {
+        return false;
+    }
+    tracing::warn!(
+        plugin,
+        "hash_salt is the public default ({DEFAULT_SALT:?}); command-correlation \
+         hashes are de-anonymizable. Set a unique per-deployment salt."
+    );
+    ctx.emit(Event::new(
+        &ctx.agent_id,
+        plugin,
+        EventPayload::Alert {
+            severity: Severity::High,
+            title: "Command-hash salt is the public default".into(),
+            detail: format!(
+                "{plugin} is using the shipped default hash_salt; command-correlation \
+                 hashes are linkable across deployments. Configure a unique salt."
+            ),
+            subject: None,
+        },
+    ))
+    .await;
+    true
 }
 
 #[derive(Default)]
@@ -60,6 +109,10 @@ impl Plugin for SessionPlugin {
 
     async fn init(&mut self, ctx: &PluginContext) -> anyhow::Result<()> {
         let cfg: SessionConfig = ctx.config_as()?;
+        // Enforce the salt-secrecy guardrail: a deployment left on the public
+        // default is loudly flagged (log + High alert) rather than silently
+        // degrading the privacy property to zero.
+        warn_on_default_salt(&cfg.hash_salt, "plugin-session", ctx).await;
         if cfg.emit_current_login {
             let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
             let tty = std::env::var("SSH_TTY")
@@ -68,7 +121,7 @@ impl Plugin for SessionPlugin {
             let remote = std::env::var("SSH_CONNECTION")
                 .ok()
                 .and_then(|c| c.split_whitespace().next().map(String::from));
-            let session_id = format!("{}:{}", user, std::process::id());
+            let session_id = new_session_id();
             ctx.emit(Event::new(
                 &ctx.agent_id,
                 "plugin-session",
@@ -190,5 +243,59 @@ mod tests {
         assert_ne!(a.command_hash, c.command_hash); // salt changes the hash
         assert_eq!(a.token_count, 3);
         assert_eq!(a.command_len, 11);
+    }
+
+    use aegis_sdk::Emitter;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    #[derive(Default)]
+    struct CapturingEmitter {
+        events: Arc<StdMutex<Vec<Event>>>,
+    }
+    #[async_trait]
+    impl Emitter for CapturingEmitter {
+        async fn emit(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+    fn test_ctx(emitter: Arc<CapturingEmitter>) -> PluginContext {
+        PluginContext {
+            agent_id: "test-agent".into(),
+            data_dir: std::env::temp_dir(),
+            config: serde_json::Value::Null,
+            emitter,
+        }
+    }
+
+    /// The public default salt trips a `High` alert (and returns true), so a
+    /// deployment that never changes it cannot silently de-anonymize.
+    #[tokio::test]
+    async fn default_salt_raises_high_alert() {
+        let emitter = Arc::new(CapturingEmitter::default());
+        let ctx = test_ctx(emitter.clone());
+        let used_default = warn_on_default_salt(DEFAULT_SALT, "plugin-session", &ctx).await;
+        assert!(used_default);
+        let events = emitter.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one alert expected");
+        match &events[0].payload {
+            EventPayload::Alert { severity, .. } => {
+                assert_eq!(*severity, Severity::High);
+            }
+            other => panic!("expected a High Alert, got {other:?}"),
+        }
+    }
+
+    /// A configured (non-default) salt is silent: no alert, returns false.
+    #[tokio::test]
+    async fn custom_salt_is_silent() {
+        let emitter = Arc::new(CapturingEmitter::default());
+        let ctx = test_ctx(emitter.clone());
+        let used_default =
+            warn_on_default_salt("per-deployment-secret", "plugin-session", &ctx).await;
+        assert!(!used_default);
+        assert!(
+            emitter.events.lock().unwrap().is_empty(),
+            "a configured salt must not raise an alert"
+        );
     }
 }

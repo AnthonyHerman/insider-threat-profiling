@@ -1,0 +1,21 @@
+# Cargo configuration committed at the repo root.
+#
+# Pins the linker for the static musl server build so that, after a fresh clone
+# on a host with `musl-tools` installed (`apt install musl-tools`, which provides
+# `musl-gcc`), `cargo build --target x86_64-unknown-linux-musl` Just Works with no
+# per-invocation `CC_*`/`RUSTFLAGS` env overrides.
+#
+# Why this is needed: once the TLS stack (`rustls` + `ring`) is linked, the musl
+# build needs a musl-targeting C toolchain for ring's `cc`-compiled component, and
+# the final link must go through a musl-aware driver. `musl-gcc` (from musl-tools)
+# is that driver and is what CI uses. On a host that has `clang` but not
+# `musl-tools`, override at the command line instead, e.g.:
+#   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=clang \
+#   CC_x86_64_unknown_linux_musl=clang \
+#     cargo build --release --bin aegisd --target x86_64-unknown-linux-musl
+#
+# This file deliberately pins ONLY the musl target; the default gnu build is
+# untouched.
+
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"

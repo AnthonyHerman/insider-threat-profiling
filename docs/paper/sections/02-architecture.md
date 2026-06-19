@@ -56,9 +56,11 @@ registration via the `register_plugin!` macro, which uses the `inventory` crate'
 distributed-slice mechanism: the macro submits a registration record at link time,
 and the kernel iterates the resulting slice at startup. Linking a plugin crate into
 a binary with `use plugin_x as _;` is the complete integration step — no registry
-file and no explicit registration call are required. The five built-in plugins
-(`plugin-process`, `plugin-session`, `plugin-agent-detect`, `plugin-scoring`,
-`plugin-tamper`) all register this way.
+file and no explicit registration call are required. The seven built-in plugins
+(`plugin-process`, `plugin-session`, `plugin-tty`, `plugin-agent-detect`,
+`plugin-scoring`, `plugin-tamper`, `plugin-transport`) all register this way:
+`plugin-tty` is the PTY/pipe keystroke- and command-timing collector, and
+`plugin-transport` is the mTLS forwarder sink.
 
 Third-party plugins may be loaded at runtime as shared objects (`cdylib`). A dynamic
 plugin exports a C-ABI entrypoint (`aegis_plugin_entry`) returning a heap-allocated
@@ -85,13 +87,21 @@ calling `try_send` on every plugin whose subscription matches the event's kind.
 Because each plugin drains its own queue independently, a slow plugin back-pressures
 only itself and never head-of-line-blocks others.
 
-Both write points — the ingress `try_send` and the per-plugin fan-out `try_send`
-— are non-blocking and drop-on-full. On saturation, events are dropped and a
-warning is logged. There is no dropped-event counter, no dead-letter queue, and no
-back-pressure signal to the producer. This bounds memory under saturation but means
-that high-frequency telemetry can be silently lost, a property that matters for a
-detection system: undetected telemetry loss is indistinguishable from the absence of
-the monitored behavior.
+The bus distinguishes *critical* event kinds (`alert`, `detection`, `score`) from
+low-value telemetry. Critical kinds take a **non-droppable** path: the dispatcher
+`send().await`s a slot on each subscribed plugin's queue, so a flood of cheap
+keystroke telemetry cannot evict an alert or a detection. Low-value kinds are
+delivered with `try_send` and dropped on a full queue — but the drops are
+**counted**, not silent: a `BusMetrics` instance maintains per-cause atomic
+counters (`ingress_dropped_full`/`ingress_dropped_closed` at the ingress,
+`fanout_dropped_full` at the fan-out) exposed via `RunningHost::bus_metrics()`, and
+`aegisd` periodically logs any increase so loss is alertable. This bounds memory
+under saturation while keeping the safety-relevant events flowing. The residual,
+stated honestly, is that under extreme sustained load *low-value* telemetry can
+still be dropped (a biased loss, since critical kinds are protected) — which is
+exactly why the counters and a tunable `queue_depth` exist. (This corrects an
+earlier draft that described drop-on-full with "no counter"; see security-audit M10,
+fixed, and ADR #4/#11.)
 
 Every plugin emits through a `ScopedEmitter` — a per-plugin wrapper around the
 shared `BusEmitter` — which automatically stamps the `source` field with the

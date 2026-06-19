@@ -147,6 +147,14 @@ sudo aegis-agent uninstall
   removes the binary + both units + manifest + token, and `daemon-reload`s.
   Each step is best-effort/idempotent (an already-gone file or unloaded unit is
   success), so a partial install is still fully removable.
+- **Removes the agent's persisted state, not just the binary.** It also deletes
+  the agent's `<state_dir>/plugin-transport/` directory (the enrolled identity,
+  the Ed25519 private key, and the pinned server fingerprints) and the telemetry
+  spill database (`spill.redb`), then removes the now-empty state directory. This
+  leaves no enrolled identity, key material, or buffered behavioral telemetry
+  behind after teardown. (Removal is best-effort and skips files an operator stored
+  outside this layout; the state dir is left in place if it still holds unrelated
+  files.)
 
 This is by design **not** a rootkit: it uses only supported OS mechanisms
 (root-owned files, the immutable attribute, a systemd watchdog pair), hides

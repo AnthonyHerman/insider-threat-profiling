@@ -2,15 +2,18 @@
 
 ### Workspace Structure
 
-Aegis is implemented as a Rust workspace of nine crates organized into three
-layers. The foundation layer consists of `aegis-sdk`, which defines the stable
-public contracts — the `Event` model and the `Plugin` trait with its
-inventory-based registration macro — and `aegis-core`, the kernel that discovers
-plugins, manages their lifecycle, and routes events over a single internal bus.
-`aegis-proto` sits alongside these two, specifying the length-framed, versioned
-wire protocol used between agent and server. Neither `aegis-sdk` nor `aegis-core`
-implements any behavioral feature; they are deliberately thin so that all domain
-logic lives in plugins.
+Aegis is implemented as a Rust workspace of fifteen crates — eight
+infrastructure/binary crates and seven plugins — organized into three layers. The
+foundation layer consists of `aegis-sdk`, which defines the stable public contracts
+— the `Event` model and the `Plugin` trait with its inventory-based registration
+macro — and `aegis-core`, the kernel that discovers plugins, manages their
+lifecycle, and routes events over a single internal bus. `aegis-proto` sits
+alongside these two, specifying the length-framed, versioned wire protocol used
+between agent and server. Two more crates support development and testing —
+`aegis-integration-tests` (the in-process end-to-end pipeline tests) and
+`example-plugin` (a reference dynamic `cdylib` plugin). Neither `aegis-sdk` nor
+`aegis-core` implements any behavioral feature; they are deliberately thin so that
+all domain logic lives in plugins.
 
 The binary layer contains three executables: `aegis-agent` (the endpoint client),
 `aegisd` (the server), and `aegisctl` (the management CLI). The agent embeds every
@@ -18,12 +21,14 @@ plugin it uses at link time via the `inventory` static discovery mechanism, so
 there is no runtime asset directory and no external plugin resolver to compromise.
 The server follows the same discipline for its own plugins.
 
-The plugin layer provides all operational capability as five crates:
-`plugin-process` (process-execution telemetry), `plugin-session` (session and
-inter-keystroke timing, content-free), `plugin-agent-detect` (the flagship
-agent-vs-human classifier, described in Sections 3–5), `plugin-scoring`
-(per-subject risk aggregation and alerting), and `plugin-tamper` (endpoint
-self-protection). The kernel dispatches events to subscribers by kind string;
+The plugin layer provides all operational capability as seven crates:
+`plugin-process` (process-execution telemetry), `plugin-session` (session lifecycle
+and the content-free command-statistics helpers), `plugin-tty` (PTY/pipe
+keystroke- and command-timing capture, content-free), `plugin-agent-detect` (the
+flagship agent-vs-human classifier, described in Sections 3–5), `plugin-scoring`
+(per-subject risk aggregation and alerting), `plugin-tamper` (endpoint
+self-protection), and `plugin-transport` (the mTLS forwarder sink). The kernel
+dispatches events to subscribers by kind string;
 plugins declare subscriptions in their `Plugin` implementation and never hold a
 reference to any other plugin, making the dependency graph explicit and the
 system incrementally extensible without modifying core [karantzas2021edr].

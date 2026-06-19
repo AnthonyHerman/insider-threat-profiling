@@ -457,11 +457,54 @@ pub fn uninstall(spec: &InstallSpec) -> anyhow::Result<()> {
         remove_if_present(path)?;
     }
 
+    // Step 4b: remove the agent's persisted state so an uninstall does not leave
+    // the enrolled cryptographic identity, the Ed25519 private key, server pins,
+    // or buffered behavioral telemetry behind. Without this, sensitive residue
+    // (the spill DB + plugin-transport/ identity) survives "uninstall", which is
+    // both a privacy leak about monitored users and a contradiction of the
+    // "removes all artifacts" contract. Best-effort/idempotent: a missing tree is
+    // success, and we never fail the uninstall on a leftover-data error.
+    let state_dir = PathBuf::from(&effective.state_dir);
+    // The forwarder writes its identity/key/pins under <state_dir>/plugin-transport/.
+    remove_dir_best_effort(&state_dir.join("plugin-transport"));
+    // The on-disk spill buffer (durable telemetry queue).
+    remove_if_present_best_effort(&state_dir.join("spill.redb"));
+    // Finally, drop the state dir itself if it is now empty (leaves it in place if
+    // an operator stored unrelated files there).
+    if let Err(e) = std::fs::remove_dir(&state_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(dir = %state_dir.display(), error = %e, "state dir not removed (non-empty or in use)");
+        }
+    }
+
     // Step 5: reload so systemd forgets the removed units.
     systemctl_best_effort(&["daemon-reload"]);
 
-    tracing::info!("aegis-agent uninstalled (immutable cleared, units disabled, files removed)");
+    tracing::info!(
+        state_dir = %effective.state_dir,
+        "aegis-agent uninstalled (immutable cleared, units disabled, files + agent state removed)"
+    );
     Ok(())
+}
+
+/// Recursively remove a directory tree, treating "not found" as success and never
+/// returning an error (uninstall must not fail because leftover data could not be
+/// cleared). Other errors are logged at warn so the operator can clean up.
+fn remove_dir_best_effort(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(dir = %path.display(), error = %e, "could not remove agent state dir (continuing)")
+        }
+    }
+}
+
+/// Like [`remove_if_present`] but never propagates an error (best-effort cleanup).
+fn remove_if_present_best_effort(path: &Path) {
+    if let Err(e) = remove_if_present(path) {
+        tracing::warn!(path = %path.display(), error = %e, "could not remove agent state file (continuing)");
+    }
 }
 
 /// Read back the install token and reconstruct the spec's installed paths, so
@@ -621,5 +664,36 @@ mod tests {
         assert_eq!(spec.run_as, "root");
         assert_eq!(spec.unit_dir, "/etc/systemd/system");
         assert_eq!(spec.state_dir, "/var/lib/aegis");
+    }
+
+    /// The state-cleanup helpers used by `uninstall` actually delete the agent's
+    /// persisted identity/key/spill, and are idempotent (a missing tree/file is
+    /// success, not an error). This pins the privacy-residue fix without requiring
+    /// root (the full `uninstall` path is root-gated).
+    #[test]
+    fn state_cleanup_removes_identity_and_spill_idempotently() {
+        let base = std::env::temp_dir().join(format!(
+            "aegis-uninstall-state-{}-{}",
+            std::process::id(),
+            aegis_sdk::now_ns()
+        ));
+        let transport = base.join("plugin-transport");
+        std::fs::create_dir_all(&transport).unwrap();
+        // Simulate the sensitive residue an enrolled agent leaves behind.
+        std::fs::write(transport.join("identity.json"), b"{}").unwrap();
+        std::fs::write(transport.join("agent_ed25519.key"), b"secret-key").unwrap();
+        std::fs::write(base.join("spill.redb"), b"telemetry").unwrap();
+
+        // First pass removes everything.
+        remove_dir_best_effort(&base.join("plugin-transport"));
+        remove_if_present_best_effort(&base.join("spill.redb"));
+        assert!(!transport.exists(), "identity dir must be gone");
+        assert!(!base.join("spill.redb").exists(), "spill db must be gone");
+
+        // Second pass is a no-op (idempotent — no panic, no error surfaced).
+        remove_dir_best_effort(&base.join("plugin-transport"));
+        remove_if_present_best_effort(&base.join("spill.redb"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

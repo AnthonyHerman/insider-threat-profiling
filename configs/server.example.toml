@@ -6,19 +6,17 @@
 # crates/aegis-core/src/config.rs) documenting the CENTRAL PROCESSOR subtrees and
 # their tunables.
 #
-# IMPORTANT — how the server is actually configured today:
-#   `aegisd run` builds its `HostConfig` IN-PROCESS (HostConfig::new("aegisd"))
-#   and does NOT take a `--config <file>` flag — see crates/aegis-server/src/main.rs.
-#   Its runtime knobs are the CLI flags:
-#       aegisd run --listen 0.0.0.0:8443 --http 127.0.0.1:8080 --data-dir /var/lib/aegis
-#   The server links the central processors statically and runs them with their
-#   built-in defaults (the values reproduced below). This file therefore serves
-#   two purposes:
-#     1. a documented reference for the central-processor config schema, and
-#     2. a drop-in starting point if/when the server learns to load a TOML
-#        (the schema and field names here match the plugin config structs).
-#   Editing this file does not change a running `aegisd`; tune via flags + the
-#   defaults shown here.
+# How the server is configured:
+#   `aegisd run` accepts `--config <file>` (like the agent) and loads it via
+#   HostConfig::from_toml_file — see crates/aegis-server/src/main.rs. Without it,
+#   the server builds its `HostConfig` in-process (HostConfig::new("aegisd")) and
+#   runs the statically-linked central processors with their built-in defaults
+#   (the values reproduced below). Pass this file to take the schema below live:
+#       aegisd run --config configs/server.example.toml \
+#                  --listen 0.0.0.0:8443 --http 127.0.0.1:8080 --data-dir /var/lib/aegis
+#   The `--data-dir` flag always overrides the file's `data_dir`. Use the load
+#   policy below (`enabled_plugins` / `disabled_plugins` / `dynamic_plugins`) to
+#   enable, disable, or add processors at runtime without recompiling.
 #
 # The server processes INGESTED telemetry; it runs no local collectors (no
 # plugin-session / plugin-process / plugin-tty / plugin-transport here).

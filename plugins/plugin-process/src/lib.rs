@@ -23,12 +23,28 @@ use std::time::Duration;
 use tokio::sync::{watch, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 
+fn default_cmdline_capture() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessConfig {
     /// Sampling interval in milliseconds.
     pub interval_ms: u64,
     /// If true, only report processes owned by non-system uids (>= 1000).
     pub interactive_uids_only: bool,
+    /// Capture the **full** process command line (all of `/proc/<pid>/cmdline`)
+    /// into `ProcessExec.cmdline`.
+    ///
+    /// Defaults to `false`: full argv is *content* — it can carry file paths and
+    /// secrets passed as flags, which would violate the platform's content-free
+    /// telemetry guarantee (THREAT_MODEL §7 guardrail 4). With this off we emit
+    /// only `argv[0]` (the invoked program path, already implied by `exe`), so
+    /// process telemetry stays timing/structure/identity only. Set `true` only in
+    /// a deployment that has explicitly accepted command-line content capture
+    /// (and the resulting P6 secret-exposure surface).
+    #[serde(default = "default_cmdline_capture")]
+    pub cmdline_capture: bool,
 }
 
 impl Default for ProcessConfig {
@@ -36,8 +52,16 @@ impl Default for ProcessConfig {
         ProcessConfig {
             interval_ms: 2000,
             interactive_uids_only: false,
+            cmdline_capture: default_cmdline_capture(),
         }
     }
+}
+
+/// Reduce a full argv to the content-free form emitted when `cmdline_capture` is
+/// off: just `argv[0]` (the program path), dropping every argument. Returns an
+/// empty vec for an empty argv.
+fn redact_cmdline(cmdline: Vec<String>) -> Vec<String> {
+    cmdline.into_iter().take(1).collect()
 }
 
 /// Stable per-process identity that survives PID reuse: the raw PID paired with
@@ -147,6 +171,13 @@ impl Plugin for ProcessPlugin {
                 };
 
                 for proc in to_emit {
+                    // Content-free by default: drop argv past argv[0] unless the
+                    // operator explicitly opted into full command-line capture.
+                    let cmdline = if cfg.cmdline_capture {
+                        proc.cmdline
+                    } else {
+                        redact_cmdline(proc.cmdline)
+                    };
                     emitter
                         .emit(Event::new(
                             &agent_id,
@@ -156,7 +187,7 @@ impl Plugin for ProcessPlugin {
                                 ppid: proc.ppid,
                                 uid: proc.uid,
                                 exe: proc.comm,
-                                cmdline: proc.cmdline,
+                                cmdline,
                                 cwd: None,
                             },
                         ))
@@ -335,6 +366,33 @@ mod tests {
         assert!(!seen.insert((100, 1000)));
         // PID 100 recycled for a brand-new process (new start time) -> emitted.
         assert!(seen.insert((100, 2000)));
+    }
+
+    /// Content-free default: `cmdline_capture` is off, so process telemetry does
+    /// not carry full argv unless a deployment opts in.
+    #[test]
+    fn cmdline_capture_defaults_off() {
+        assert!(!ProcessConfig::default().cmdline_capture);
+        // An absent subtree key also resolves to off.
+        let cfg: ProcessConfig = serde_json::from_value(serde_json::json!({
+            "interval_ms": 2000, "interactive_uids_only": false
+        }))
+        .unwrap();
+        assert!(!cfg.cmdline_capture);
+    }
+
+    /// `redact_cmdline` keeps only argv[0] — the program path (already implied by
+    /// `exe`) — and drops every argument, which is where secrets/paths live.
+    #[test]
+    fn redact_cmdline_keeps_only_argv0() {
+        let full = vec![
+            "/usr/bin/psql".to_string(),
+            "--password=hunter2".to_string(),
+            "db".to_string(),
+        ];
+        assert_eq!(redact_cmdline(full), vec!["/usr/bin/psql".to_string()]);
+        // Empty argv stays empty (no panic).
+        assert!(redact_cmdline(vec![]).is_empty());
     }
 
     /// The bounded-eviction policy retains only identities present in the latest

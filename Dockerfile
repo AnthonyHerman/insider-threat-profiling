@@ -17,11 +17,15 @@
 # =============================================================================
 
 # ---- Stage 1: build the static musl binary ---------------------------------
-# The toolchain is pinned by rust-toolchain.toml (Rust 1.92, with the
-# x86_64-unknown-linux-musl target). musl-tools provides `musl-gcc`, which the
-# TLS stack (rustls + ring) needs to link statically — exactly as CI does
-# (see .github/workflows/ci.yml and docs/BUILD.md).
-FROM rust:1.92 AS build
+# The base image is pinned to the SAME exact version as rust-toolchain.toml
+# (channel = "1.92.0"). Matching the patch level (not the floating `1.92` minor
+# tag) means rustup will not try to download a *different* exact toolchain at
+# build time when the base image's `1.92` tag advances to a new patch — removing
+# both the surprise network dependency and the version-skew the mismatch caused.
+# Keep this in lockstep with rust-toolchain.toml when bumping Rust.
+# musl-tools provides `musl-gcc`, which the TLS stack (rustls + ring) needs to
+# link statically — exactly as CI does (see .github/workflows/ci.yml, docs/BUILD.md).
+FROM rust:1.92.0 AS build
 
 # C toolchain that targets musl (for `ring`). Matches the CI "musl-tools" step.
 RUN apt-get update \

@@ -204,7 +204,11 @@ async fn main() -> anyhow::Result<()> {
             // the authenticated administrator escape hatch.
             let spec = plugin_tamper::install::InstallSpec::default();
             plugin_tamper::install::uninstall(&spec)?;
-            println!("Uninstalled aegis-agent (immutable cleared, units disabled, files removed).");
+            println!(
+                "Uninstalled aegis-agent (immutable cleared, units disabled, binary + units \
+                 removed, and agent state under the state dir — enrolled identity, key, pins, \
+                 and the telemetry spill — deleted)."
+            );
             Ok(())
         }
         Command::Guard { service } => {
@@ -316,6 +320,15 @@ fn inject_tamper_defaults(config: &mut HostConfig) {
 /// duration and restored on exit. Telemetry goes to stderr (with
 /// `--print-events`) so it does not corrupt the PTY-owned stdout stream.
 async fn shell(args: ShellArgs) -> anyhow::Result<()> {
+    // Mirror the collectors' salt-secrecy guardrail (the shell path has no host /
+    // bus, so we warn loudly rather than emit a bus alert): a public-default salt
+    // makes the command-correlation hashes de-anonymizable.
+    if args.hash_salt == plugin_session::DEFAULT_SALT {
+        tracing::warn!(
+            "--hash-salt is the public default; command-correlation hashes are \
+             de-anonymizable. Pass a unique per-deployment --hash-salt."
+        );
+    }
     let emitter: Arc<dyn Emitter> = Arc::new(StderrEmitter {
         print: args.print_events,
     });

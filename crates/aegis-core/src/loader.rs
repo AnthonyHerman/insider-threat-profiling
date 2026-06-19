@@ -40,6 +40,18 @@ pub struct DynamicPlugin {
 /// the boundary becomes fully opaque-handle-based.
 pub fn load_dynamic(path: impl AsRef<Path>) -> anyhow::Result<DynamicPlugin> {
     let path = path.as_ref();
+
+    // Pre-open integrity gate. A full cryptographic check (Ed25519/SHA-256 against
+    // a pin in the immutable config) is the tracked hardening item (ADR #15 /
+    // security-audit H5) and is *not* yet implemented. Until it lands we apply the
+    // cheap, no-config defence the threat model calls for: refuse to `dlopen` a
+    // shared object (or one in a directory) that is world-writable, and — when the
+    // host runs as root — that is not owned by root. This blocks the
+    // "drop a malicious `.so` in a writable path" escalation without weakening the
+    // same-toolchain/same-ABI contract. Best-effort: a path we cannot stat falls
+    // through to the open below so the canonical open error is preserved.
+    check_load_path_safety(path)?;
+
     // SAFETY: see the function-level contract above.
     unsafe {
         let library = libloading::Library::new(path)
@@ -101,5 +113,127 @@ pub fn load_dynamic(path: impl AsRef<Path>) -> anyhow::Result<DynamicPlugin> {
             library,
             constructor,
         })
+    }
+}
+
+/// Reject a dynamic-plugin path that an unprivileged or untrusted writer could
+/// have controlled, *before* the library is opened (opening runs its code).
+///
+/// On Unix: the `.so` itself, and the directory containing it, must not be
+/// world-writable; and when the host runs as root, both must be owned by root
+/// (uid 0). A path that cannot be `stat`ed is left to the subsequent open so its
+/// error is reported verbatim (this also keeps a "missing file" an open error,
+/// not a permission error). On non-Unix this is a no-op.
+fn check_load_path_safety(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        // SAFETY: `geteuid()` is always-safe (no args, no pointers, cannot fail).
+        // We test the *effective* uid because that is the privilege the dlopen
+        // would actually run with (matches plugin-tamper's `is_root`).
+        let running_as_root = unsafe { libc::geteuid() } == 0;
+
+        let check = |label: &str, p: &Path| -> anyhow::Result<()> {
+            let meta = match std::fs::metadata(p) {
+                Ok(m) => m,
+                // Leave a missing/unreadable path to the open below.
+                Err(_) => return Ok(()),
+            };
+            // World-writable is never acceptable: anyone could swap the code.
+            if meta.mode() & 0o002 != 0 {
+                bail!(
+                    "refusing to load dynamic plugin: {label} {} is world-writable",
+                    p.display()
+                );
+            }
+            // Under root, a non-root owner means a less-privileged user could
+            // have planted the code that root would then execute.
+            if running_as_root && meta.uid() != 0 {
+                bail!(
+                    "refusing to load dynamic plugin: {label} {} is not owned by root (uid {})",
+                    p.display(),
+                    meta.uid()
+                );
+            }
+            Ok(())
+        };
+
+        check("shared object", path)?;
+        if let Some(parent) = path.parent() {
+            // An empty parent ("" for a bare filename) means the current dir; skip
+            // — relative loads are a dev convenience and `.` ownership is noisy.
+            if !parent.as_os_str().is_empty() {
+                check("containing directory", parent)?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A world-writable `.so` is rejected before any open is attempted.
+    #[test]
+    fn world_writable_so_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "aegis-loader-ww-{}-{}",
+            std::process::id(),
+            aegis_sdk::now_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let so = dir.join("evil.so");
+        std::fs::write(&so, b"not a real library").unwrap();
+        // Make the file world-writable (but keep the dir tight).
+        std::fs::set_permissions(&so, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let err = check_load_path_safety(&so)
+            .expect_err("a world-writable .so must be refused before dlopen");
+        assert!(
+            err.to_string().contains("world-writable"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A non-world-writable `.so` in a tight directory passes the gate (the open
+    /// then fails for an unrelated reason — it is not a real library — which is
+    /// fine; the gate's job is only to *permit* a safe path).
+    #[test]
+    fn tight_perms_pass_the_gate() {
+        let dir = std::env::temp_dir().join(format!(
+            "aegis-loader-ok-{}-{}",
+            std::process::id(),
+            aegis_sdk::now_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let so = dir.join("plugin.so");
+        std::fs::write(&so, b"stub").unwrap();
+        std::fs::set_permissions(&so, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            check_load_path_safety(&so).is_ok(),
+            "a 0644 file in a 0755 dir must pass the safety gate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing path is *not* a gate failure — it is deferred to the open so the
+    /// canonical "opening dynamic plugin" error is what surfaces.
+    #[test]
+    fn missing_path_defers_to_open() {
+        let p = Path::new("/nonexistent/aegis-loader-missing.so");
+        assert!(
+            check_load_path_safety(p).is_ok(),
+            "a missing path must defer to the open, not fail the gate"
+        );
     }
 }

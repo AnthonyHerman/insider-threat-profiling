@@ -21,6 +21,9 @@ toml.workspace = true
 inventory.workspace = true
 libloading.workspace = true
 futures.workspace = true
+# Used only for the Unix `geteuid()` privilege check in the dynamic-plugin
+# load-path safety gate (loader.rs); no-op on non-Unix targets.
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

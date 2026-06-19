@@ -6,7 +6,8 @@
 //!   load the in-process plugin set and print build facts; they need no running
 //!   server.
 //! * **Server control** — [`Command::EnrollToken`], [`Command::Status`],
-//!   [`Command::Agents`], and [`Command::Alerts`] talk to a running `aegisd`'s
+//!   [`Command::Agents`], [`Command::Alerts`], [`Command::Scores`], and
+//!   [`Command::Detections`] talk to a running `aegisd`'s
 //!   loopback operator API (default `http://127.0.0.1:8080`). They speak plain
 //!   HTTP/1.1 over a [`tokio::net::TcpStream`] via the tiny in-crate [`http`]
 //!   client — no `reqwest`/TLS dependency, matching the project's self-contained
@@ -55,6 +56,10 @@ enum Command {
     Agents(ServerArgs),
     /// List recent alerts.
     Alerts(AlertsArgs),
+    /// List the latest per-subject risk scores.
+    Scores(ScoresArgs),
+    /// List the latest per-subject agent-vs-human detections.
+    Detections(DetectionsArgs),
 }
 
 /// Enrollment-token lifecycle, all against `GET/POST/DELETE /api/v1/tokens`.
@@ -107,6 +112,45 @@ struct AlertsArgs {
     server: ServerArgs,
 }
 
+/// `scores` filters on top of [`ServerArgs`]. `--agent` selects the
+/// `/api/v1/scores/:agent_id` route; the rest are server-side query filters on
+/// `/api/v1/scores`.
+#[derive(Args, Clone)]
+struct ScoresArgs {
+    /// Only scores for this enrolled agent (uses the per-agent endpoint).
+    #[arg(long)]
+    agent: Option<String>,
+    /// Only scores at or above this value.
+    #[arg(long)]
+    min_score: Option<f64>,
+    /// Maximum number of rows to return.
+    #[arg(long)]
+    limit: Option<usize>,
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+/// `detections` filters on top of [`ServerArgs`]. `--agent` selects the
+/// `/api/v1/detections/:agent_id` route; the rest are server-side query filters
+/// on `/api/v1/detections`.
+#[derive(Args, Clone)]
+struct DetectionsArgs {
+    /// Only detections for this enrolled agent (uses the per-agent endpoint).
+    #[arg(long)]
+    agent: Option<String>,
+    /// Only detections with this verdict (`agent`, `human`, or `uncertain`).
+    #[arg(long)]
+    verdict: Option<String>,
+    /// Only detections at or above this confidence.
+    #[arg(long)]
+    min_confidence: Option<f64>,
+    /// Maximum number of rows to return.
+    #[arg(long)]
+    limit: Option<usize>,
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -117,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Status(args) => cmd_status(args).await,
         Command::Agents(args) => cmd_agents(args).await,
         Command::Alerts(args) => cmd_alerts(args).await,
+        Command::Scores(args) => cmd_scores(args).await,
+        Command::Detections(args) => cmd_detections(args).await,
     }
 }
 
@@ -320,6 +366,113 @@ async fn cmd_alerts(args: AlertsArgs) -> anyhow::Result<()> {
                 r["ts_ns"].as_u64().unwrap_or(0),
             );
         }
+    }
+    Ok(())
+}
+
+async fn cmd_scores(args: ScoresArgs) -> anyhow::Result<()> {
+    // `--agent` uses the per-agent route (no server-side query filters); the
+    // global route accepts min_score/limit as query params. We apply min_score
+    // and limit client-side in the per-agent case so the flags behave the same
+    // either way.
+    let (path, client_filter) = match &args.agent {
+        Some(agent) => (format!("/api/v1/scores/{}", percent_encode(agent)), true),
+        None => {
+            let mut query: Vec<(String, String)> = Vec::new();
+            if let Some(min) = args.min_score {
+                query.push(("min_score".into(), min.to_string()));
+            }
+            if let Some(limit) = args.limit {
+                query.push(("limit".into(), limit.to_string()));
+            }
+            (with_query("/api/v1/scores", &query), false)
+        }
+    };
+
+    let resp = http::get(&args.server.server, &path).await?;
+    let v = resp.json_ok()?;
+    if args.server.json {
+        print_json(&v);
+        return Ok(());
+    }
+    let mut rows = v.as_array().cloned().unwrap_or_default();
+    if client_filter {
+        if let Some(min) = args.min_score {
+            rows.retain(|r| r["score"].as_f64().unwrap_or(0.0) >= min);
+        }
+        if let Some(limit) = args.limit {
+            rows.truncate(limit);
+        }
+    }
+    println!(
+        "{:36}  {:24}  {:>8}  {:20}  TS_NS",
+        "AGENT_ID", "SUBJECT", "SCORE", "MODEL"
+    );
+    for r in rows {
+        println!(
+            "{:36}  {:24}  {:>8.1}  {:20}  {}",
+            r["agent_id"].as_str().unwrap_or(""),
+            truncate(r["subject"].as_str().unwrap_or(""), 24),
+            r["score"].as_f64().unwrap_or(0.0),
+            truncate(r["model"].as_str().unwrap_or(""), 20),
+            r["ts_ns"].as_u64().unwrap_or(0),
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_detections(args: DetectionsArgs) -> anyhow::Result<()> {
+    let (path, client_filter) = match &args.agent {
+        Some(agent) => (
+            format!("/api/v1/detections/{}", percent_encode(agent)),
+            true,
+        ),
+        None => {
+            let mut query: Vec<(String, String)> = Vec::new();
+            if let Some(verdict) = &args.verdict {
+                query.push(("verdict".into(), verdict.clone()));
+            }
+            if let Some(min) = args.min_confidence {
+                query.push(("min_confidence".into(), min.to_string()));
+            }
+            if let Some(limit) = args.limit {
+                query.push(("limit".into(), limit.to_string()));
+            }
+            (with_query("/api/v1/detections", &query), false)
+        }
+    };
+
+    let resp = http::get(&args.server.server, &path).await?;
+    let v = resp.json_ok()?;
+    if args.server.json {
+        print_json(&v);
+        return Ok(());
+    }
+    let mut rows = v.as_array().cloned().unwrap_or_default();
+    if client_filter {
+        if let Some(verdict) = &args.verdict {
+            rows.retain(|r| r["verdict"].as_str() == Some(verdict.as_str()));
+        }
+        if let Some(min) = args.min_confidence {
+            rows.retain(|r| r["confidence"].as_f64().unwrap_or(0.0) >= min);
+        }
+        if let Some(limit) = args.limit {
+            rows.truncate(limit);
+        }
+    }
+    println!(
+        "{:36}  {:24}  {:9}  {:>6}  TS_NS",
+        "AGENT_ID", "SUBJECT", "VERDICT", "CONF"
+    );
+    for r in rows {
+        println!(
+            "{:36}  {:24}  {:9}  {:>6.2}  {}",
+            r["agent_id"].as_str().unwrap_or(""),
+            truncate(r["subject"].as_str().unwrap_or(""), 24),
+            truncate(r["verdict"].as_str().unwrap_or(""), 9),
+            r["confidence"].as_f64().unwrap_or(0.0),
+            r["ts_ns"].as_u64().unwrap_or(0),
+        );
     }
     Ok(())
 }

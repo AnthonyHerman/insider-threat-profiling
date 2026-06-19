@@ -57,6 +57,12 @@ enum Command {
 
 #[derive(Parser)]
 struct RunArgs {
+    /// Path to a TOML host configuration file (optional). Mirrors the agent's
+    /// `--config`: lets an operator enable/disable the central processors or add
+    /// `dynamic_plugins` at runtime without recompiling. When omitted the server
+    /// uses its built-in defaults (`HostConfig::new("aegisd")`).
+    #[arg(long)]
+    config: Option<String>,
     /// Address for the TLS ingest listener (agents connect here).
     #[arg(long, default_value = "0.0.0.0:8443")]
     listen: String,
@@ -119,7 +125,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         proto_version: aegis_proto::PROTO_VERSION,
     };
 
-    let mut config = HostConfig::new("aegisd");
+    // Load the operator's TOML if `--config` was given (so the central
+    // processors and any `dynamic_plugins` are enable/disable/loadable at
+    // runtime, exactly as on the agent); otherwise fall back to built-in
+    // defaults. The `--data-dir` flag always wins so the store/TLS material and
+    // the host's plugin `data_dir` stay co-located regardless of the TOML.
+    let mut config = match &args.config {
+        Some(path) => HostConfig::from_toml_file(path)?,
+        None => HostConfig::new("aegisd"),
+    };
     config.data_dir = data_dir.clone();
     // The server does not collect local telemetry; it processes ingested events.
     // Build the host with the store sink as an explicit plugin (highest

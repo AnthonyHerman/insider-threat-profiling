@@ -2,8 +2,14 @@
 
 ## Prerequisites
 - Rust (pinned in `rust-toolchain.toml`, 1.92).
+- A C compiler (gcc or clang) — `ring` (pulled in via `rustls`) compiles a small
+  C/assembly component with the `cc` crate, so a C toolchain is required even for
+  the default `x86_64-unknown-linux-gnu` build. On Debian/Ubuntu:
+  `apt install build-essential`. (CI's `ubuntu-latest` runner has gcc preinstalled.)
 - For the static server: the musl target (`rustup target add x86_64-unknown-linux-musl`)
-  and a C toolchain for `ring` (CI installs `musl-tools`, which provides `musl-gcc`).
+  and a musl-targeting C toolchain for `ring` (CI installs `musl-tools`, which
+  provides `musl-gcc`). The committed `.cargo/config.toml` pins the musl linker to
+  `musl-gcc`, so the build works after `apt install musl-tools` with no env overrides.
 
 ## Development build
 ```bash
@@ -23,11 +29,17 @@ ldd target/x86_64-unknown-linux-musl/release/aegisd   # => "statically linked"
 ```
 
 > **musl + ring note.** Once the TLS stack (`rustls` + `ring`) is linked, the
-> musl build needs a C compiler that targets musl. On CI we install `musl-tools`
-> (`musl-gcc`). On a host without it, either install `musl-tools` or point cargo
-> at clang:
+> musl build needs a musl-targeting C toolchain for ring's `cc`-compiled
+> component. The committed `.cargo/config.toml` pins the musl linker to
+> `musl-gcc`, so the standard route is just:
 > ```bash
-> CC_x86_64_unknown_linux_musl=musl-gcc \
+> apt install musl-tools   # provides musl-gcc
+> cargo build --release --bin aegisd --target x86_64-unknown-linux-musl
+> ```
+> On a host that has `clang` but not `musl-tools`, override at the command line:
+> ```bash
+> CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=clang \
+> CC_x86_64_unknown_linux_musl=clang \
 >   cargo build --release --bin aegisd --target x86_64-unknown-linux-musl
 > ```
 

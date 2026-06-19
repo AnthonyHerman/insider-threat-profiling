@@ -18,7 +18,10 @@ hardware (see [`docs/linode-integration.md`](docs/linode-integration.md)).
   subscription, and manages lifecycle. Plugins are discovered **statically** (via
   `inventory`, just by being linked) and **dynamically** (a versioned C-ABI
   entrypoint loaded from a shared object, with the enable/disable policy evaluated
-  on the declared name *before* `dlopen`).
+  on the declared name *before* `dlopen`). The dynamic loader also applies a
+  pre-`dlopen` path-safety gate (refusing a world-writable `.so`/directory, and a
+  non-root-owned one when running as root); a cryptographic signature gate remains
+  future (ADR #15).
 - **Stable contracts (`aegis-sdk`).** The `Event` model and the `Plugin`
   trait/registration that every capability is built against.
 - **Back-pressure.** Bounded per-plugin queues (`queue_depth`, default 4096) with
@@ -32,10 +35,16 @@ hardware (see [`docs/linode-integration.md`](docs/linode-integration.md)).
   per-command structural statistics: length, token count, Shannon entropy, salted
   correlation hash) and `plugin-tty` (interactive shell instrumented via a PTY;
   keystroke timing + command structure). No raw keystrokes or command text are
-  ever stored or emitted.
+  ever stored or emitted. Session identifiers are **opaque random UUIDs** (not the
+  guessable `user:pid`), and both collectors raise a `High` alert on startup if the
+  command-hash salt is left at the public default — making per-deployment salt
+  secrecy an enforced invariant rather than only advice.
 - **Process collector (`plugin-process`).** Samples `/proc`, emitting
   `ProcessExec` for newly-seen processes (PID + start-time keyed, so PID reuse is
-  handled), capturing lineage and uid as part of the behavioral picture.
+  handled), capturing lineage and uid as part of the behavioral picture. Full
+  command-line content (`cmdline`) is **off by default** (only `argv[0]` is
+  emitted) behind an explicit `cmdline_capture` opt-in, preserving the content-free
+  guarantee unless a deployment consciously enables it.
 - **Forwarder (`plugin-transport`).** Batches telemetry and ships it to the server
   over **pinned mutual TLS**, with an in-memory ring plus on-disk spill so events
   survive a server outage; full-jitter exponential reconnect backoff, keepalives,
@@ -57,7 +66,9 @@ hardware (see [`docs/linode-integration.md`](docs/linode-integration.md)).
 - **Authenticated root-only uninstall.** `aegis-agent uninstall` is the
   deliberate administrator escape hatch: gated on uid 0 (authority), not on the
   install token (intent); clears immutability first, then disables/removes
-  everything, idempotently.
+  everything, idempotently. It also deletes the agent's persisted state — the
+  enrolled identity, Ed25519 key, server pins, and the telemetry spill — so no key
+  material or buffered behavioral data survives teardown.
 
 ### Server (`aegisd`)
 - **Single self-contained, statically-linked binary.** No external database and
@@ -72,11 +83,17 @@ hardware (see [`docs/linode-integration.md`](docs/linode-integration.md)).
 - **Ingest + storage + API.** A TLS ingest listener for enrolled agents, the
   embedded store sink, a live command router, an HTTP/JSON operator API with an
   SSE live feed, and the embedded dashboard.
+- **`--config` flag.** `aegisd run --config <file>` loads a TOML `HostConfig`
+  (mirroring the agent), so the central processors and any `dynamic_plugins` can
+  be enabled/disabled/loaded at runtime without recompiling; `--data-dir` always
+  overrides the file.
 
 ### Management CLI (`aegisctl`)
 - List discovered plugins; show platform/server identity (cert fingerprint,
   protocol version, agent count); manage one-time enrollment tokens
-  (create/list/revoke); list enrolled agents and recent alerts.
+  (create/list/revoke); list enrolled agents, recent alerts, the latest
+  per-subject **risk scores** (`aegisctl scores`), and **detections**
+  (`aegisctl detections`) — both with optional `--agent`/filter flags and `--json`.
 
 ### Detection model
 - Transparent, **explainable** additive model (`transparent-additive/v1`) over
@@ -90,9 +107,14 @@ hardware (see [`docs/linode-integration.md`](docs/linode-integration.md)).
   hardware-integration report, build & contributing guides, a plugin-authoring
   guide, plus a research paper and a blog post.
 - Example configs (`configs/agent.example.toml`, `configs/server.example.toml`),
-  a scratch-based `Dockerfile` for the self-contained server, and demo scripts.
+  a scratch-based `Dockerfile` for the self-contained server (pinned to the same
+  exact Rust patch as `rust-toolchain.toml`), a committed `.cargo/config.toml`
+  pinning the musl linker (`musl-gcc`) so a fresh clone builds after
+  `apt install musl-tools`, and demo scripts.
 - CI on every push/PR: `rustfmt`, `clippy -D warnings`, workspace build + tests
-  (`--locked`), and a dedicated job that builds the static musl `aegisd`,
-  asserts it is statically linked, and uploads it as an artifact.
+  (`--locked`), and a reproducibility check that regenerates `docs/paper/results.md`
+  from the seeded `eval_report` example and fails on any drift. A dedicated job
+  (gated `needs: [test]`) builds the static musl `aegisd`, asserts it is statically
+  linked, and uploads it as an artifact.
 
 [0.1.0]: https://github.com/AnthonyHerman/insider-threat-profiling/releases/tag/v0.1.0

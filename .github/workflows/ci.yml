@@ -29,9 +29,23 @@ jobs:
         run: cargo build --workspace --locked
       - name: test
         run: cargo test --workspace --locked
+      - name: eval results are reproducible (results.md is verbatim)
+        # The paper states results.md is "taken verbatim from the reproducible
+        # harness output". The PRNG is seeded, so the example is deterministic;
+        # regenerate and fail on any drift so the committed table can never
+        # silently diverge from the model/feature code that produces it.
+        # (docs/model-comparison.md is a curated narrative that *embeds* the
+        # model_comparison numbers, not verbatim stdout, so it is not diffed here.)
+        run: |
+          cargo run --release -p plugin-agent-detect --example eval_report --locked > /tmp/results.md
+          if ! diff -u docs/paper/results.md /tmp/results.md; then
+            echo "::error::docs/paper/results.md is stale; regenerate with: cargo run --release -p plugin-agent-detect --example eval_report > docs/paper/results.md"
+            exit 1
+          fi
 
   static-server:
     name: self-contained server (static musl)
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1124,12 +1124,20 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_setconfig_is_acked_unsupported() {
-        struct Noop;
+        // SetConfig has no live implementation (no Plugin::reconfigure); the
+        // dispatcher must reject it AND emit nothing, so a future partial wiring
+        // cannot silently half-apply. We assert both the negative ack and that no
+        // event was emitted.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counter(Arc<AtomicUsize>);
         #[async_trait::async_trait]
-        impl Emitter for Noop {
-            async fn emit(&self, _e: Event) {}
+        impl Emitter for Counter {
+            async fn emit(&self, _e: Event) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
-        let em: Arc<dyn Emitter> = Arc::new(Noop);
+        let n = Arc::new(AtomicUsize::new(0));
+        let em: Arc<dyn Emitter> = Arc::new(Counter(n.clone()));
         let res = dispatch_command(
             Uuid::new_v4(),
             ServerCommand::SetConfig {
@@ -1146,6 +1154,60 @@ mod tests {
                 assert!(detail.unwrap().contains("unsupported"));
             }
             _ => panic!("expected CommandResult"),
+        }
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            0,
+            "SetConfig must not emit any event while it is unimplemented"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_rescore_acks_and_emits_one_custom_trigger() {
+        // `Rescore` is a fire-and-forget local trigger: it acks ok:true and emits
+        // exactly one Custom event tagged `transport.rescore`. No processor in the
+        // workspace subscribes to that kind yet (the full re-scoring orchestration
+        // is deferred), so this pins the emitted shape that a future consumer will
+        // key on and guards against the path silently breaking.
+        struct Capture(Arc<std::sync::Mutex<Vec<Event>>>);
+        #[async_trait::async_trait]
+        impl Emitter for Capture {
+            async fn emit(&self, e: Event) {
+                self.0.lock().unwrap().push(e);
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let em: Arc<dyn Emitter> = Arc::new(Capture(seen.clone()));
+        let id = Uuid::new_v4();
+        let res = dispatch_command(
+            id,
+            ServerCommand::Rescore {
+                subject: "uid:1000".into(),
+            },
+            "agent-x",
+            &em,
+        )
+        .await;
+        match res {
+            Message::CommandResult { ok, id: rid, .. } => {
+                assert!(ok, "rescore should ack ok:true");
+                assert_eq!(rid, id);
+            }
+            _ => panic!("expected CommandResult"),
+        }
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1, "rescore must emit exactly one event");
+        assert_eq!(
+            events[0].kind, "transport.rescore",
+            "the emitted trigger must be tagged transport.rescore"
+        );
+        // The payload carries the requested subject so a future consumer can act.
+        match &events[0].payload {
+            EventPayload::Custom(v) => {
+                assert_eq!(v["type"], "rescore_request");
+                assert_eq!(v["subject"], "uid:1000");
+            }
+            other => panic!("expected a Custom rescore payload, got {other:?}"),
         }
     }
 

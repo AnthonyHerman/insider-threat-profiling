@@ -26,8 +26,11 @@
 
 The core question, from `aegis_sdk::Verdict`, is ternary: **Human**, **Agent**, or
 **Uncertain**. The subject is an interactive session (`SessionId`); the evidence is
-timing- and structure-only telemetry produced by collector plugins
-(`plugin-session`, `plugin-process`).
+timing- and structure-only telemetry. The keystroke/command timing the model keys on
+comes from **`plugin-tty`** (the PTY/pipe collector that emits `Keystroke` /
+`CommandObserved`); `plugin-session` emits session lifecycle (`SessionStart`) plus
+the content-free command-statistics helpers, and `plugin-process` emits
+`ProcessExec`.
 
 ### 1.1 The adversary is *adaptive*
 
@@ -180,44 +183,87 @@ telemetry.
 
 A deliberately **transparent additive model**: each feature maps to an
 "agent-evidence" value in `[0,1]` via a logistic transfer with a documented centre
-and slope, combined as a weighted average. `p_agent ≥ 0.65 ⇒ Agent`,
+and slope, combined as a weighted average. `p_agent ≥ 0.62 ⇒ Agent`,
 `≤ 0.35 ⇒ Human`, else `Uncertain`. Transparency is the right call for an
 insider-threat tool — every verdict must be explainable via `Detection.reasons` to
-an analyst. **The change proposed below is which terms, not the model class.**
+an analyst.
+
+The re-weighting argued for in earlier revisions of this document **has shipped**:
+the live model is **eleven terms**, with the cheap Tier-1 marginals *demoted* to a
+combined ≈0.24 and the bulk of the weight (≈0.66) moved onto Tier-2/3 joint-structure
+terms an i.i.d.-delay evader cannot reproduce. The Agent threshold was tightened
+`0.65 → 0.62` so the re-weighted robust evidence on an evaded agent still crosses
+while the human distribution (≈0.03) stays far below. (This section used to describe
+a six-term, `0.65`-threshold baseline; that baseline is **superseded** — see ADR #5
+in `ARCHITECTURE.md`. The weights below are `model.rs::terms`, verbatim.)
+
+**Tier-1 marginals (demoted; combined ≈0.24):**
 
 | Feature | Term | Weight | Transfer (agent-evidence) |
 |---|---|---|---|
-| `keystroke_cv` | metronomic-typing | 0.25 | `σ(8·(0.45 − cv))` |
-| `paste_ratio` | paste-injection | 0.20 | `clamp(paste_ratio)` |
-| `mean_inter_command_ms` | instant-reaction | 0.25 | `σ(0.004·(1000 − mean_ms))` |
-| `backspace_ratio` | errorless-input | 0.15 | `σ(40·(0.06 − bs_ratio))` |
-| `entropy_mean` | dense-commands | 0.05 | `σ(3·(H − 4.2))` |
-| `cadence_regularity` | regular-cadence | 0.10 | `clamp(1 − min(cv_cmd, 1))` |
+| `keystroke_cv` | metronomic-typing | 0.06 | `σ(8·(0.45 − cv))` |
+| `paste_ratio` | paste-injection | 0.04 | `clamp(paste_ratio)` |
+| `mean_inter_command_ms` | instant-reaction | 0.10 | `σ(0.004·(1000 − mean_ms))` |
+| `backspace_ratio` | errorless-input | 0.04 | `σ(40·(0.06 − bs_ratio))` |
+| `entropy_mean` | dense-commands | 0.02 | `σ(3·(H − 4.2))` |
+| `cadence_regularity` | regular-cadence | 0.04 | `clamp(cadence_regularity)` |
 
-Gated at `MIN_KEYSTROKES = 12`, `MIN_COMMANDS = 3`; re-assessed every
-`assess_every = 10` events and on `SessionEnd`.
+**Tier-2/3 joint-structure terms (promoted; combined ≈0.66):**
 
-### 4.2 The headline finding
+| Feature | Term | Weight | Transfer (agent-evidence) |
+|---|---|---|---|
+| `gap_autocorr` | gap-non-autocorrelation | 0.22 | `σ(6·(0.18 − x))` (NaN below robust gate) |
+| `think_tail_ratio` | constant-think-time | 0.12 | `σ(2.2·(2.0 − x))` |
+| `throughput_decay` | no-throughput-decay | 0.14 | `σ(4·(x + 0.05))` |
+| `whole_line_paste_ratio` | whole-line-injection | 0.12 | `clamp(whole_line_paste_ratio)` |
+| `keystroke_burst_cv` | burst-metronome | 0.06 | `σ(8·(0.30 − x))` (NaN if too few bursts) |
 
-**All six production features are in the cheaply-faked tier** (§5.1). The model is a
-strong baseline against a naive agent and effectively defenseless against an
-adaptive one. The fix is not better thresholds on these six — they check *moments*,
-and moments are free to fake — but **migrating weight onto evasion-robust features**,
-most of which are already computable from on-the-wire data.
+Terms whose evidence is `NaN` (the volume-hungry Tier-3 features below
+`MIN_COMMANDS_ROBUST`) are dropped and the weighted average renormalizes over the
+survivors, so a short session leans on the hard rules and the Tier-1 remnants → more
+`Uncertain` by design. Re-assessed every `assess_every = 10` events and on
+`SessionEnd`.
+
+**Three asymmetric hard rules** (noisy-OR / max-pooling; can only *raise* `p_agent`,
+each appending an auditable reason) are also live in `model.rs::assess`:
+
+1. `physiological-floor+paste` — sustained sub-floor reactions (`reaction_floor_hits
+   ≥ 0.25`) co-occurring with whole-line delivery (`whole_line_paste_ratio ≥ 0.5`)
+   ratchets `p_agent` to ≥ 0.92.
+2. `reaction-time-floor` — sustained sub-floor reactions alone ratchet to ≥ 0.80
+   (with the same `≥ 0.25` minimum-evidence gate, so a single isolated slip only
+   nudges the average).
+3. `uncorrelated-flat-throughput` — the i.i.d.-delay evader signature: ≈0
+   autocorrelation **and** flat throughput **and** a narrow think-time tail
+   (`< 1.6`) simultaneously ratchets to ≥ 0.72. A genuine heavy-tailed human does
+   not trip it.
+
+### 4.2 The headline finding (and what was done about it)
+
+The original six features were all in the cheaply-faked tier (§5.1): a strong
+baseline against a naive agent, effectively defenseless against an adaptive one. The
+fix — already implemented — was not better thresholds on those six but **migrating
+the decision weight onto evasion-robust features** (the §5.3 Tier-3 set), most of
+which were already computable from on-the-wire data. The demoted Tier-1 marginals
+are kept as cheap corroborators, not as the basis of the verdict.
 
 ### 4.3 The path: transparent → calibrated → ensemble
 
-The `Model` interface stays; the internals evolve in three steps:
+The `Model` interface stays; the internals evolved in three steps. **Steps 1–2 have
+shipped** (this is the model described in §4.1); step 3 is partly done:
 
-1. **Re-weight (transparent, immediate).** Demote the six Tier-1 marginals to ~0.15
-   combined; move ~0.60 of decision weight onto Tier-3 correlation/joint-structure
-   features and ~0.25 onto Tier-2 distribution-shape features (§5).
-2. **Add interaction terms + hard rules.** Encode "faked one marginal, broke the
-   joint" directly as evidence terms (§5.3), and add asymmetric "can only
-   incriminate" physiological rules (§5.4).
-3. **Calibrate + sequential test.** Platt/isotonic-calibrate the score so
-   `confidence` is a real `P(agent | x)`, and wrap the per-snapshot assessment in a
-   **sequential probability ratio test** over the session (§7).
+1. **Re-weight (transparent).** *Done.* Tier-1 marginals demoted to ≈0.24 combined;
+   ≈0.66 of the weight moved onto the Tier-2/3 distribution-shape and
+   correlation/joint-structure terms (§5).
+2. **Interaction terms + hard rules.** *Done.* The three asymmetric "can only
+   incriminate" rules of §4.1 (physiological floor, floor+paste, uncorrelated-flat-
+   throughput) are live; pure *absence* of a signal never pushes toward Human (§5.4).
+3. **Calibrate + sequential test.** *Sequential test done; calibration is future.*
+   The per-snapshot assessment is folded into an **EWMA sequential test** over the
+   session (lib.rs `ewma_alpha` + `Model::log_likelihood_ratio`; §7.3), so a session
+   that *consistently* leans agent is escalated even if no single snapshot crosses
+   `agent_threshold`. What remains genuinely future is **calibration**: `confidence`
+   is still the raw weighted average, not a Platt/isotonic `P(agent | x)`.
 
 ---
 
@@ -226,7 +272,12 @@ The `Model` interface stays; the internals evolve in three steps:
 The discriminating axis is **"what must the attacker construct to fake this, and
 does faking it force a detectable distortion elsewhere?"** Three tiers.
 
-### 5.1 Tier 1 — cheaply faked (single moment-match). All six live features.
+### 5.1 Tier 1 — cheaply faked (single moment-match). The original six features.
+
+> **Status:** these six were the *entire* original model and are now **demoted** to
+> a combined ≈0.24 of the weight (§4.1); the analysis below is why. The weights
+> quoted inline in this subsection are the *original* Tier-1 weights, retained to
+> explain the evasion that motivated the re-weighting — not the live weights.
 
 Each falls to one scalar moment-match, a few lines of code, no model of human
 behavior:
@@ -246,13 +297,15 @@ behavior:
 - **`cadence_regularity` (0.10).** Randomize gaps. Same moment-match.
 - **`entropy_mean` (0.05).** Already weak; interleave short commands.
 
-**Verdict on Tier 1:** an adaptive agent that (a) stops pasting, (b) adds a constant
-~1.5 s pre-command delay, (c) jitters keystrokes, and (d) fakes a 10% backspace flag
-drives the current model from `p_agent ≈ 0.85` (the `agent_like` test fixture) down
-through 0.35 into solid **Human**. This evasion is **~30 lines of code and costs the
-agent ~3–5× wall-clock throughput** — the only thing it pays. The model has *no
-defense* because it never checks the *shape* of the faked distributions, only their
-first moment.
+**Verdict on Tier 1 (against the *original* six-feature model):** an adaptive agent
+that (a) stops pasting, (b) adds a constant ~1.5 s pre-command delay, (c) jitters
+keystrokes, and (d) fakes a 10% backspace flag would drive *that* model from
+`p_agent ≈ 0.85` down through 0.35 into solid **Human** for ~30 lines of code,
+costing only ~3–5× wall-clock throughput. That model had *no defense* because it
+never checked the *shape* of the faked distributions, only their first moment. The
+**live** model closes this: those four moves now move ≈0.24 of the weight at most,
+and the same i.i.d.-delay evasion *creates* the `gap-non-autocorrelation` and
+`uncorrelated-flat-throughput` tells that now carry the verdict (§5.3).
 
 ### 5.2 Tier 2 — moderately expensive (correct parametric family)
 
@@ -360,15 +413,15 @@ xychart-beta
     line [0.88, 0.85, 0.80, 0.66, 0.45, 0.30]
 ```
 
-*Upper curve at high `e` = Tier-3-weighted ensemble (Regime B); lower curve =
-current six-feature model (Regime A).*
+*Upper curve at high `e` = the Tier-3-weighted model that **ships today** (Regime B,
+§4.1); lower curve = the superseded six-feature baseline (Regime A).*
 
-- **Regime A (current, 6 Tier-1 features).** `p_agent(e)` collapses fast and
+- **Regime A (the superseded six Tier-1 features).** `p_agent(e)` collapses fast and
   concavely: the attacker spends the first budget units on the highest-weight,
   cheapest features (drop paste −0.20; add command delay −0.25; add jitter −0.25).
   By `e ≈ 0.4` it has crossed below 0.35. **The curve hits the floor before the
   budget is half-spent** — there is no effort wall.
-- **Regime B (Tier-3-weighted).** `p_agent(e)` is convex-then-floored: cheap moves
+- **Regime B (Tier-3-weighted; the live model).** `p_agent(e)` is convex-then-floored: cheap moves
   barely move it (Tier-1 carries little weight). Progress requires climbing into
   Tier 2 (correct distributions) and Tier 3 (correlations), and **the marginal
   evasions interfere** — making throughput decay realistic perturbs autocorrelation;
@@ -444,10 +497,10 @@ attack), while *leaving the Tier-3 structure agent-like* (i.i.d. gaps, no throug
 decay, decoupled backspaces, sub-floor slips). Higher `e` optionally layers Tier-2
 distribution-matching.
 
-> **The point of the evasion knob:** an honest evaluation must show that the current
-> six features collapse by `e ≈ 0.4` while the robust set degrades gracefully. A
-> generator that only emits naive agents would flatter the current model and hide
-> the finding.
+> **The point of the evasion knob:** an honest evaluation must show that the original
+> six features collapse by `e ≈ 0.4` while the robust set (now the shipped model)
+> degrades gracefully. A generator that only emits naive agents would flatter the
+> old marginals-only model and hide the finding.
 
 ### 6.2 Evaluation harness
 
@@ -503,19 +556,27 @@ un-calibrated weighted average; multiplying it by `agent_detection_weight = 60`
 makes the `alert_threshold = 75` arbitrary. Calibration makes the risk arithmetic
 defensible.
 
-### 7.3 Govern FPR over the session with a sequential test
+### 7.3 Govern FPR over the session with a sequential test — *implemented (EWMA form)*
 
-The detector currently re-assesses every `assess_every` events as a *memoryless
-snapshot*. For a repeated game where evidence accrues, use a **sequential
-probability ratio test (SPRT)**:
+The detector no longer treats each `assess_every`-event re-assessment as a
+*memoryless snapshot*. A **sequential test over the session is live**:
+`Model::log_likelihood_ratio` returns each snapshot's agent-evidence in log-odds
+(`logit(p_agent)`), and `lib.rs` folds those into an **EWMA** (config `ewma_alpha`,
+default 0.3, validated at init). When the smoothed log-odds crosses `escalate_logit`
+a session that merely *camps* `Uncertain` is escalated to `Agent` — the
+dead-band-camping defense (cross-reference `THREAT_MODEL.md` §5.1(b), "Now
+implemented"). This eliminates the per-snapshot FPR compounding (every 10 events was
+otherwise another coin-flip against a human) and lets time favor the defender.
+
+The EWMA is the shipped, dependency-free realization of the idea below; a strict
+Wald **SPRT** with explicit `(α, β)` accept/reject bounds remains a possible
+refinement:
 
 - Maintain `Λ = Σ log[ p(xₜ | agent) / p(xₜ | human) ]` as events arrive.
 - Declare **Agent** when `Λ ≥ B = log((1 − β)/α)`, **Human** when
   `Λ ≤ A = log(β/(1 − α))`, else keep watching.
 - Wald's bounds approximately guarantee target `(α, β)` **regardless of session
-  length** — the FPR control the deployment needs, and it eliminates the
-  per-snapshot FPR compounding (every 10 events is otherwise another coin-flip
-  against a human).
+  length**.
 
 SPRT specifically beats snapshotting here because the robust Tier-3 features
 (autocorrelation, throughput decay, long-pause presence) **need ~16–30 commands to
@@ -672,12 +733,12 @@ throughput, sustains correlated timing, and never slips on the physiological flo
 | Work | File | Change |
 |---|---|---|
 | New features + raised gates | `plugins/plugin-agent-detect/src/features.rs` | Extend `SessionAccumulator` to retain ordered gap/keystroke series and `Event.ts_ns`; add Ring 1/2 feature computations and `FeatureVector` fields + `to_map` entries; raise `MIN_COMMANDS` for robust features. Note: sub-floor `inter_command_ns` gaps are already retained by the current filter (drops only zero and ≥ 1 h); no filter change needed. |
-| Re-weight, interaction terms, hard rules, SPRT, calibration | `plugins/plugin-agent-detect/src/model.rs` | Re-weight `terms()`; add interaction/noisy-OR terms and asymmetric hard rules; carry SPRT log-likelihood-ratio state; apply Platt/isotonic calibration to `confidence` |
+| Calibration (remaining model work) | `plugins/plugin-agent-detect/src/model.rs` | **Done:** the Tier-1/Tier-3 re-weighting of `terms()`, the asymmetric noisy-OR hard rules, and the sequential-test input (`log_likelihood_ratio`, accumulated as an EWMA in `lib.rs`). **Remaining:** Platt/isotonic calibration of `confidence` to a true `P(agent\|x)` (it is still the raw weighted average) |
 | Synthetic generator + harness | `plugins/plugin-agent-detect/src/synth.rs` (new module, behind `#[cfg(test)]` or a `synth` feature) | Seeded human/agent/evasion-knob trace generator (§6.1) using workspace `rand`/`statrs`; emit `Keystroke`/`CommandObserved` with `ts_ns` |
 | Evaluation harness/example | `plugins/plugin-agent-detect/tests/evaluation.rs` (new) and/or `plugins/plugin-agent-detect/examples/eval_report.rs` (new) | Cohort sampling across evasion budgets; report precision/recall/ROC-AUC/PR-AUC; degradation curve + AUC-vs-budget; ablation across rings; CI regression assertions (§6.3) |
 | Accept mimicry-anomaly / calibrated risk | `plugins/plugin-scoring/src/lib.rs` | Extend `handle` beyond `Verdict::Agent` to add risk from high-confidence `Uncertain`-with-mimicry-anomaly detections; treat `confidence` as calibrated |
 | New content-free wire fields (Ring 3) | `crates/aegis-sdk/src/event.rs` | Add `keystrokes_in_command`, `delete_events`, `exit_status`, `shell_syntax_error`, salted `cwd_hash`, `delivered_as_paste:bool`, completion/source-kind flags to `CommandObserved`/`Keystroke` as `#[serde(default)]` to stay wire-compatible |
-| Populate new fields at the collector | `plugins/plugin-session/src/lib.rs`, `plugins/plugin-process/src/lib.rs` | Emit the Ring 3 fields content-free (reuse `command_stats`/salted-hash pattern; populate `ProcessExec.cwd`) |
+| Populate new fields at the collector | `plugins/plugin-tty/src/analyzer.rs` (keystroke/command stats), `plugins/plugin-process/src/lib.rs` (`ProcessExec.cwd` only) | Emit the Ring 3 `Keystroke`/`CommandObserved` fields content-free where the command stats are computed — `analyzer.rs` already calls `plugin_session::command_stats`, so the salted-hash pattern is reused there. `plugin-process` is the place for `ProcessExec.cwd`. |
 
 > Workspace already provides `rand` and `statrs` (`Cargo.toml` `[workspace.dependencies]`),
 > so the generator and goodness-of-fit/quantile math need no new external crates;
@@ -688,17 +749,21 @@ throughput, sustains correlated timing, and never slips on the physiological flo
 
 ## Appendix: bottom line
 
-- **The current six-feature model is entirely Tier-1.** ~30 lines of evasion (stop
-  pasting, constant command delay, jitter keystrokes, fake a backspace flag) drives
-  `p_agent` from ~0.85 to solidly Human at a cost of *only throughput*. Re-thresholding
-  cannot save it — the features check moments, and moments are free to fake.
+- **The original six-feature model was entirely Tier-1, and has been superseded.**
+  ~30 lines of evasion (stop pasting, constant command delay, jitter keystrokes,
+  fake a backspace flag) drove *that* model's `p_agent` from ~0.85 to solidly Human
+  at a cost of *only throughput*; re-thresholding could not save it because the
+  features checked moments, and moments are free to fake. The **live** model (§4.1)
+  demotes those six to a combined ≈0.24 and puts ≈0.66 on the robust set below.
 - **Robustness comes from correlation/joint-structure features, not better
-  marginals.** The defensible core is `error_recovery_coupling`, gap/phase
-  autocorrelation, `sustained_throughput_no_decay`, `whole_line_injection_ratio`,
-  `think_time_tail_ratio`, `log_normal_fit_residual`, and the hard physiological
-  rules `reaction_time_floor` + `session_duration_without_long_pause`. Shared
-  property: **the cheap evasion of a Tier-1 feature actively generates the Tier-3
-  tell.**
+  marginals — and this is now what ships.** The live model's promoted terms are
+  `gap-non-autocorrelation`, `no-throughput-decay`, `whole-line-injection`,
+  `constant-think-time`, and `burst-metronome`, plus the three asymmetric hard rules
+  (physiological floor, floor+paste, uncorrelated-flat-throughput). The richer
+  Tier-2/3 set still on the roadmap (`error_recovery_coupling`,
+  `log_normal_fit_residual`, `session_duration_without_long_pause`, …) extends it.
+  Shared property: **the cheap evasion of a Tier-1 feature actively generates the
+  Tier-3 tell.**
 - **Most of the robust set is free.** Rings 1–2 need no schema change — they consume
   `CommandObserved.inter_command_ns` (accumulated as `inter_commands_ms` internally),
   `Event.ts_ns`, `Keystroke.is_paste`/`burst_len`, `CommandObserved.command_len`, and the
@@ -708,7 +773,7 @@ throughput, sustains correlated timing, and never slips on the physiological flo
   `exit_status`.
 - **The winning meta-strategy makes evasion economically self-defeating:** weight
   robust features so the only way to evade is to become as slow and error-prone as a
-  human, wrapped in SPRT sequential testing (time favors the defender), a
-  too-perfect-mimicry anomaly on the covariance structure, and FPR-budgeted,
-  context-stratified, randomized thresholds calibrated from the human-only
-  distribution.
+  human (shipped), wrapped in sequential testing so time favors the defender (shipped
+  as the EWMA-of-log-odds escalation; a strict SPRT is a possible refinement). Still
+  future: a too-perfect-mimicry anomaly on the covariance structure, and FPR-budgeted,
+  context-stratified, randomized thresholds calibrated from the human-only distribution.

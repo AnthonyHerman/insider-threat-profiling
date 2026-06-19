@@ -55,8 +55,10 @@ queue_depth = 4096
 # code), then asserts the library's reported name matches. The built-in agent
 # plugins are statically linked, so most deployments leave this empty.
 #
-# NOTE: there is currently no signature/integrity gate on dynamic `.so` files
-# (see docs/security-audit.md H5); only load shared objects you built and trust.
+# NOTE: the loader refuses a world-writable `.so` (or one in a world-writable
+# directory), and — when the agent runs as root — one not owned by root, before
+# opening it. There is still no CRYPTOGRAPHIC signature/integrity gate (see
+# docs/security-audit.md H5); only load shared objects you built and trust.
 # [[dynamic_plugins]]
 # name = "plugin-custom"
 # path = "/usr/local/lib/aegis/libplugin_custom.so"
@@ -90,6 +92,14 @@ interval_ms = 2000
 # If true, only report processes owned by non-system uids (>= 1000) — i.e. focus
 # on interactive user activity and ignore system daemons. Default: false.
 interactive_uids_only = false
+# Capture the FULL process command line into ProcessExec.cmdline. Default: false.
+#
+# NOTE: full argv is CONTENT — it can carry file paths and secrets passed as CLI
+# flags, which violates the content-free telemetry guarantee. With this off (the
+# default) only argv[0] (the program path, already implied by `exe`) is emitted.
+# Enable ONLY in a deployment that has explicitly accepted command-line content
+# capture and the resulting secret-exposure surface (THREAT_MODEL §4.4 P6).
+cmdline_capture = false
 
 # --- plugin-tty: interactive-shell behavioral telemetry (PTY) ------------------
 # Captures the same content-free substrate as plugin-session (keystroke timing +

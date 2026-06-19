@@ -77,7 +77,10 @@ pub struct TtyConfig {
 }
 
 fn default_salt() -> String {
-    "aegis-default-salt".to_string()
+    // Single source of truth, shared with plugin-session so the two collectors'
+    // hashes correlate by default — and so the same "public default" warning
+    // fires from both.
+    plugin_session::DEFAULT_SALT.to_string()
 }
 
 impl Default for TtyConfig {
@@ -111,6 +114,10 @@ impl Plugin for TtyPlugin {
 
     async fn init(&mut self, ctx: &PluginContext) -> anyhow::Result<()> {
         let cfg: TtyConfig = ctx.config_as()?;
+        // Same salt-secrecy guardrail as plugin-session: flag a public-default
+        // salt loudly (log + High alert) instead of silently de-anonymizing.
+        // Done even in `mode = "off"` so a misconfiguration is visible regardless.
+        plugin_session::warn_on_default_salt(&cfg.hash_salt, "plugin-tty", ctx).await;
         let session_id = current_session_id();
         let acfg = AnalyzerConfig {
             hash_salt: cfg.hash_salt,
@@ -152,11 +159,11 @@ impl Plugin for TtyPlugin {
     }
 }
 
-/// Session id following the platform convention `"{user}:{pid}"` (matches
-/// plugin-session).
+/// An opaque, unguessable session id (random UUIDv4), shared with plugin-session
+/// via [`plugin_session::new_session_id`]. Opaque-by-design so a co-located
+/// process cannot enumerate/forge a victim's session_id (THREAT_MODEL §4.2 A6).
 pub fn current_session_id() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    format!("{}:{}", user, std::process::id())
+    plugin_session::new_session_id()
 }
 
 /// Run an instrumented interactive shell directly, bypassing the host.
@@ -230,8 +237,18 @@ mod tests {
     }
 
     #[test]
-    fn session_id_has_user_pid_shape() {
-        let id = current_session_id();
-        assert!(id.contains(':'), "session id should be user:pid, got {id}");
+    fn session_id_is_opaque_and_unguessable() {
+        // No longer a guessable user:pid shape — it is a random UUIDv4, so two
+        // calls differ and it carries no enumerable process metadata.
+        let a = current_session_id();
+        let b = current_session_id();
+        assert_ne!(a, b, "session ids must be unique per call");
+        assert_eq!(a.len(), 36, "expected a UUIDv4 string, got {a}");
+        assert_eq!(a.matches('-').count(), 4, "expected UUID hyphenation: {a}");
+        // It must NOT leak the pid (the old guessable component).
+        assert!(
+            !a.contains(&std::process::id().to_string()),
+            "session id must not embed the pid: {a}"
+        );
     }
 }

@@ -223,6 +223,106 @@ async fn alerts_table_and_filters() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scores_table_json_and_per_agent() {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "GET /api/v1/scores".into(),
+        reply(
+            200,
+            "OK",
+            r#"[{"agent_id":"a1","subject":"uid:1000","model":"risk-aggregator/v1","score":82.5,"ts_ns":7}]"#,
+        ),
+    );
+    routes.insert(
+        "GET /api/v1/scores/a1".into(),
+        reply(
+            200,
+            "OK",
+            r#"[{"agent_id":"a1","subject":"sess-1","model":"risk-aggregator/v1","score":12.0,"ts_ns":9}]"#,
+        ),
+    );
+    let (base, _stop) = spawn_fake_api(routes).await;
+
+    // Global listing renders a table (filters go into the ignored query string).
+    let (ok, stdout, stderr) = run_cli(&["scores", "--server", &base, "--min-score", "50"]);
+    assert!(ok, "scores failed: {stderr}");
+    assert!(stdout.contains("SUBJECT"), "header missing: {stdout}");
+    assert!(stdout.contains("uid:1000"));
+    assert!(stdout.contains("82.5"));
+
+    // --json passthrough.
+    let (ok, stdout, _e) = run_cli(&["scores", "--server", &base, "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v[0]["subject"], "uid:1000");
+
+    // --agent hits the per-agent route.
+    let (ok, stdout, stderr) = run_cli(&["scores", "--server", &base, "--agent", "a1"]);
+    assert!(ok, "scores --agent failed: {stderr}");
+    assert!(stdout.contains("sess-1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detections_table_json_and_per_agent_filter() {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "GET /api/v1/detections".into(),
+        reply(
+            200,
+            "OK",
+            r#"[{"agent_id":"a1","subject":"sess-1","verdict":"agent","confidence":0.91,"model":"m","reasons":["r"],"ts_ns":7}]"#,
+        ),
+    );
+    routes.insert(
+        "GET /api/v1/detections/a1".into(),
+        reply(
+            200,
+            "OK",
+            r#"[{"agent_id":"a1","subject":"sess-1","verdict":"agent","confidence":0.91,"model":"m","reasons":["r"],"ts_ns":7},
+                {"agent_id":"a1","subject":"sess-2","verdict":"human","confidence":0.80,"model":"m","reasons":[],"ts_ns":8}]"#,
+        ),
+    );
+    let (base, _stop) = spawn_fake_api(routes).await;
+
+    let (ok, stdout, stderr) = run_cli(&[
+        "detections",
+        "--server",
+        &base,
+        "--verdict",
+        "agent",
+        "--min-confidence",
+        "0.5",
+    ]);
+    assert!(ok, "detections failed: {stderr}");
+    assert!(stdout.contains("VERDICT"), "header missing: {stdout}");
+    assert!(stdout.contains("agent"));
+    assert!(stdout.contains("0.91"));
+
+    let (ok, stdout, _e) = run_cli(&["detections", "--server", &base, "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v[0]["verdict"], "agent");
+
+    // --agent uses the per-agent route; the client-side --verdict filter then
+    // keeps only the matching row (the per-agent endpoint returns both).
+    let (ok, stdout, stderr) = run_cli(&[
+        "detections",
+        "--server",
+        &base,
+        "--agent",
+        "a1",
+        "--verdict",
+        "agent",
+    ]);
+    assert!(ok, "detections --agent failed: {stderr}");
+    assert!(stdout.contains("sess-1"));
+    assert!(
+        !stdout.contains("sess-2"),
+        "client-side verdict filter should drop the human row: {stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enroll_token_create_list_revoke() {
     let mut routes = HashMap::new();
     routes.insert(

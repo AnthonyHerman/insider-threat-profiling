@@ -112,10 +112,12 @@ for host facts). `postcard` (spill encoding) **is** already a workspace dep
 
 ## 2. TLS (rustls + ring)
 
-The workspace already pins `rustls 0.23 { ring, std, tls12 }`,
-`tokio-rustls 0.26 { ring, tls12 }`, and `rcgen 0.13 { ring, pem }`
-(`Cargo.toml:54-57`) — ring-backed and musl-friendly, matching the
-"self-contained static binary" constraint in `crates/aegis-server/src/main.rs`.
+The workspace pins `rustls 0.23 { ring, std }`,
+`tokio-rustls 0.26 { ring }`, and `rcgen 0.13 { ring, pem }`
+(`Cargo.toml`) — ring-backed and musl-friendly, matching the
+"self-contained static binary" constraint in `crates/aegis-server/src/main.rs`. The
+`tls12` cargo feature has been **dropped** (security-audit L1), so TLS 1.2 is
+excluded at the crate-feature level as well as by the runtime version pin below.
 
 ### 2.1 Server certificate — self-signed on first run (rcgen)
 
@@ -181,8 +183,9 @@ Build both configs with
 `.with_protocol_versions(&[&rustls::version::TLS13])`. There are no legacy peers,
 so allowing TLS 1.2 only widens the surface. Pinning 1.3 also gives a clean
 RFC-5705 keying-material **exporter** for channel binding in the auth handshake
-(§4.4). Consider dropping the `tls12` cargo feature from the `rustls` /
-`tokio-rustls` workspace entries for these crates.
+(§4.4). The `tls12` cargo feature has additionally been **dropped** from the
+`rustls`/`tokio-rustls` workspace entries (security-audit L1), so the runtime
+version pin is belt-and-suspenders rather than the sole defense.
 
 `PinnedVerifier` must be unit-tested against: (a) correct pin → `Ok`;
 (b) one-byte-off pin → `Err`; (c) a different self-signed cert → `Err`;
@@ -492,7 +495,7 @@ none requires a wire-grammar change.
 | **RT-3** | **Telemetry forgery.** `EventBatch.events` is `Vec<Event>` and `Event.payload` can be **any** `EventPayload` — including `Detection`/`Alert`/`Score`. One forged `Detection{ verdict: Agent, confidence: 1.0 }` makes `plugin-scoring` add `agent_detection_weight (60.0) * confidence` and fire an `Alert` at `alert_threshold 75.0` (`plugins/plugin-scoring/src/lib.rs:33-38,98-149`) — a critical finding with zero behavioral telemetry. The `subject` inside the payload is never authenticated. | At ingest, enforce a **per-agent payload-kind allowlist**: collectors may submit only raw-telemetry kinds (`process.exec`, `session.start`/`end`, `input.keystroke`, `command.observed`, `heartbeat`); **reject** `detection`/`score`/`alert` (server-derived). Namespace `subject` server-side (`format!("{agent_id}:{subject}")`) so no endpoint can manufacture findings about another's subjects/uids; scoring keys on the namespaced subject. Validate numeric ranges (`confidence ∈ [0,1]`, finite `f64` — reject NaN/Inf). Quarantine offenders + tamper `Alert`. |
 | **RT-4** | **Telemetry suppression.** (a) `handle()` is driven by the host's per-plugin queue, which the dispatcher fills with `try_send` and **drops on full** (`crates/aegis-core/src/host.rs:221-225`, `crates/aegis-core/src/bus.rs:31`); with `Subscriptions::All` and `queue_depth 4096`, a flood silently drops events *before* they reach the forwarder ring — so "the ring is the controlled overflow point" is false under load. (b) drop-oldest on ring/spill discards the *earliest* (incriminating) events under induced backpressure. (c) root compromise can delete spill/identity files. | (a) Surface host-queue drops as a counter + periodic `Alert` so blind-by-flood is visible; size the forwarder path so its own bounded ring is the only intended drop point. (b) Maintain a per-agent monotonic sequence + periodic signed `Heartbeat` carrying drop counts; the server alerts on sequence gaps / nonzero drops (loss becomes detectable). (c) Keep spill/identity root-owned `0600` and add them to `plugin-tamper`'s `protected_paths` (`plugins/plugin-tamper/src/lib.rs:36-37,121-135`) so deletion raises `Critical`; the monitored unprivileged user already cannot touch root-owned files. |
 | **RT-5** | **Replay of whole `EventBatch` frames.** At-least-once means the agent retransmits un-acked batches; an on-path attacker or compromised agent can also replay captured frames or re-send the same events under a **fresh** `batch_id` (the dedup key is sender-chosen), defeating a `batch_id`-only LRU. Replayed `detection`/`process.exec`/`alert` re-bump scores / re-fire alerts. | Dedup on per-event `Event.id` (already a `Uuid`), **not** `batch_id` alone; persist a per-agent high-watermark + recent-id set in the server redb (survives restarts). Bound freshness: reject `Event.ts_ns` outside a ±skew window. Cap per-subject score-increase rate server-side to blunt inflation. |
-| **RT-6** | **TLS downgrade / weak parameters.** `tls12` is enabled (`Cargo.toml:55-56`) and no version floor is set, so sessions may negotiate 1.2; a verifier slip degrades to accept-any. | Pin **TLS 1.3 only** via `.with_protocol_versions(&[&rustls::version::TLS13])` (§2.3); drop the `tls12` feature. Unit-test `PinnedVerifier` for correct/off-by-one/different/short certs; verify the **end-entity** leaf and still delegate signature checks to the ring provider. |
+| **RT-6** | **TLS downgrade / weak parameters.** *Resolved.* The `tls12` cargo feature has been **dropped** from the `rustls`/`tokio-rustls` workspace entries (security-audit L1), and the configs pin **TLS 1.3 only** via `.with_protocol_versions(&[&rustls::version::TLS13])` (§2.3), so TLS 1.2 cannot be negotiated at either the feature or the version level. | Done (TLS-1.3-only + `tls12` feature removed). `PinnedVerifier` is unit-tested for correct/off-by-one/different/short certs; it verifies the **end-entity** leaf and still delegates signature checks to the ring provider. |
 | **RT-7** | **Cert-pin bypass at bootstrap / via logs / on rotation.** Pin confidentiality rests on the OOB channel (same exposure as `RT-1`); `aegisd` logs the fingerprint (a verify value); pin **rotation is unspecified**, so a legit cert regen looks identical to a MITM (fleet outage or temptation to disable pinning). | Deliver the pin only over an authenticated/confidential OOB channel; treat the enroll blob as a secret (stdin/0600/shred). Mark the logged fingerprint **verify-only**; access-control server logs. Support a **set** of accepted pins in `identity.json` (current + next) for pre-cutover rotation (§4.1); provide an authenticated re-pin via the command path signed by the enrolled key — never via plain `SetConfig`. Distinguish "pin mismatch" from network errors in operator UX. |
 | **RT-8** | **Ingest resource exhaustion.** `read_message` does `vec![0u8; len]` sized from the attacker-supplied length prefix *before* reading the body (`crates/aegis-proto/src/lib.rs:142`); many slow connections each declaring ~16 MiB ≈ `max_conns * 16 MiB` (~64 GiB at 4096). A valid 16 MiB batch of tiny events ⇒ hundreds of thousands of `emit()` calls toward the shared bus. No enrollment rate limit; `serde_json` recursion on nested `Custom`. | Don't pre-allocate to the full declared size — read in bounded chunks up to the cap, and enforce a small **receive** cap (the design's `batch_max_bytes` 1 MiB) on ingest. Per-conn/per-agent byte+frame token buckets; reject batches with `> N` events before iterating `emit`. Short first-frame/handshake deadline (e.g. 5 s) and a per-IP connection+enrollment-attempt rate limiter in front of the semaphore. Bound `serde_json` depth; reject oversized `Custom`. Fair-queue ingest emit per agent so one agent cannot starve the shared bus. |
 | **RT-9** | **Malicious / abused server→agent commands.** `SetConfig` can push arbitrary JSON into a named plugin (blind scoring via huge `alert_threshold`, neuter detection via `decay=0`/zero weights, or redirect exfil via the forwarder's `server` config field). `Isolate.reason` is echoed into an `Alert` detail (XSS/log-injection sink) and can be mass-fired (alert storm). Commands are dispatched with no per-command authZ/rate-limit/audit; producers include the deferred unauthenticated `--http` API. | Authenticate/authorize command **producers** (the `--http` API + `aegisctl` must require operator auth — the deferred gap is the real hole) and audit every command with operator identity. Constrain `SetConfig` to an allowlist of plugins/keys; **forbid** remote changes to security-critical fields (`transport.server`/pins, scoring thresholds/weights, tamper `protected_paths`); `Plugin::reconfigure` validates against a schema and rejects out-of-policy values. Treat forwarder server/pin as immutable-at-runtime (only via the authenticated re-pin/enroll path). Escape/​bound `Isolate.reason` before it enters alerts/logs/dashboard. Rate-limit + de-dup inbound commands on the agent; bind commands to the authenticated session (channel binding, `RT-2`) so relayed/replayed commands are rejected. Consider requiring an operator signature on high-impact commands (`Isolate`, `SetConfig`) so a server compromise alone cannot weaponize the fleet. |
@@ -859,8 +862,8 @@ rotation is not read as a permanent MITM (`RT-7`).
 **Workspace `Cargo.toml`**:
 - Add `base64` to `[workspace.dependencies]` (not currently declared). Avoid
   `subtle`/`hostname` (use `sha2` + manual ct-compare, and `/proc` + `std::env`).
-  Optionally drop the `tls12` feature from the `rustls`/`tokio-rustls` entries
-  (`RT-6`).
+  The `tls12` feature has been dropped from the `rustls`/`tokio-rustls` entries
+  (`RT-6`, security-audit L1) — done.
 - **Expect `Cargo.lock` to grow:** the TLS/crypto/storage stack is currently
   absent from the lock (see §1.1); commit the regenerated lock after first build.
 

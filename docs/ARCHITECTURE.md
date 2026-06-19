@@ -19,7 +19,8 @@ The roadmap of concrete next steps is at the end.
 > Alert (`crates/aegis-integration-tests/tests/pipeline.rs`). See
 > [Implementation status](#implementation-status). The genuinely open items are
 > a small set of hardening gaps tracked in the ADR (most prominently a
-> signature/hash integrity gate on dynamically loaded `.so` plugins).
+> *cryptographic* signature/hash integrity gate on dynamically loaded `.so`
+> plugins; a pre-`dlopen` path-ownership/permission gate is already in place).
 
 ---
 
@@ -48,10 +49,16 @@ Two axioms, stated in `crates/aegis-sdk/src/lib.rs`, drive every other choice:
 
 - **Everything is an `Event`.** Telemetry, derived signals, scores, detections,
   and alerts all share one envelope (`aegis_sdk::Event`) and travel one bus.
-- **Everything is a `Plugin`.** The kernel (`aegis-core`) implements *no*
-  features. It discovers plugins, wires them onto the bus, routes events by
-  subscription, and manages lifecycle. Detection, scoring, collection,
-  transport, persistence, and even endpoint self-protection are all plugins.
+- **The kernel implements no features; the processing surface is plugin-delivered.**
+  The kernel (`aegis-core`) discovers plugins, wires them onto the bus, routes
+  events by subscription, and manages lifecycle — and nothing else. Detection,
+  scoring, collection, transport, and endpoint self-protection are all plugins,
+  and on the server *persistence* is delivered as the store-sink plugin. The
+  precise invariant (not "literally every feature is a plugin") is that the kernel
+  is feature-free and the **bus is the seam**: the server's network ingress (the
+  TLS listener) and operator egress (the HTTP/JSON API + dashboard) are thin
+  *non-plugin* I/O drivers wired around that bus — they hold a `RunningHost::emitter()`
+  and an `Arc<Store>` rather than registering as plugins (see `server-design.md`).
 
 A strict dependency layering enforces this: `aegis-sdk` (contracts) ← `aegis-core`
 (kernel) ← binaries. Plugins depend **only** on `aegis-sdk`, never on the
@@ -457,11 +464,15 @@ flowchart LR
 > now checks enablement *before* opening the library (a disabled-but-listed path is
 > never `dlopen`ed), wraps the entrypoint and every constructor in `catch_unwind`,
 > rejects a `.so` whose reported metadata name does not match its declared name, and
-> frees the registration in the plugin's own allocator. The ABI-version handshake
-> still cannot make untrusted code *safe*, and there is currently **no signature or
-> content-hash integrity gate** on the path — `loader.rs` documents that only
-> trusted, integrity-checked paths should be loaded, but does not enforce it. This
-> is the most significant open hardening item (see the ADR).
+> frees the registration in the plugin's own allocator. It also applies a
+> **pre-`dlopen` path-safety gate**: a world-writable `.so` (or one in a
+> world-writable directory), and — when the host runs as root — one not owned by
+> root, is refused before the library is opened. The ABI-version handshake still
+> cannot make untrusted code *safe*, and there is currently **no cryptographic
+> signature or content-hash integrity gate** on the path — the path-ownership gate
+> blocks the "drop a malicious `.so` in a writable path" escalation but does not
+> authenticate the code's provenance. The cryptographic gate is the most significant
+> open hardening item (see the ADR).
 
 ### ABI version handling is asymmetric
 
@@ -874,10 +885,10 @@ flowchart LR
 > Status: CI (`.github/workflows/ci.yml`) has a `static-server` job that builds
 > `aegisd` for `x86_64-unknown-linux-musl` (installing `musl-tools` for the
 > linker) and asserts the result with `ldd ... => statically linked`, uploading
-> the binary as an artifact. Gaps that remain: there is no `.cargo/config.toml`
-> pinning the musl cross-linker (CI relies on `musl-tools` instead), and
-> `aegisd`'s doc comment references a `BUILD.md` that does not exist. One caveat
-> to document: a static musl binary cannot safely `dlopen` a glibc-linked `.so`,
+> the binary as an artifact. A committed `.cargo/config.toml` now pins the musl
+> linker (`musl-gcc`) so a fresh clone builds after `apt install musl-tools`, and
+> `docs/BUILD.md` exists and is the referenced build guide. One caveat to
+> document: a static musl binary cannot safely `dlopen` a glibc-linked `.so`,
 > so **dynamic plugins for a musl server must also be built for musl.**
 
 ---
@@ -1075,7 +1086,7 @@ will route the kinds you subscribed to.
 |------|--------|
 | Event model (`aegis-sdk`) | Implemented, tested |
 | Plugin trait + static (`inventory`) registration | Implemented, tested |
-| Dynamic (cdylib) loader | Implemented, tested (allocator-correct free, `catch_unwind`, enable-before-load, name match; **no signature/hash integrity gate** — see ADR #15) |
+| Dynamic (cdylib) loader | Implemented, tested (allocator-correct free, `catch_unwind`, enable-before-load, name match, **pre-`dlopen` path-safety gate** — world-writable / non-root-owned-under-root refused; **no cryptographic signature/hash gate yet** — see ADR #15) |
 | Kernel: discovery, dispatch, lifecycle, back-pressure (+ drop metrics, critical-kind back-pressure, per-plugin source/agent_id stamping) | Implemented, tested |
 | Wire protocol (`aegis-proto`) + TLS-1.3 config + SHA-256 pinning + Ed25519 auth | Implemented, tested |
 | `plugin-process`, `plugin-session`, `plugin-tamper` (collectors/control) | Implemented, tested |
@@ -1090,10 +1101,10 @@ will route the kinds you subscribed to.
 | Privileged installer (copy, `chattr +i`, systemctl) + guardian watchdog + uninstall | Implemented (`O_NOFOLLOW` + `fchown`; SIGTERM tripwire) |
 | Content-integrity tamper-watch (SHA-256 manifest + immutable-bit) | Implemented, tested |
 | Static musl build (CI `ldd` static-link assertion) | Implemented (`static-server` job in CI) |
-| Dynamic-plugin `.so` signature/hash integrity gate | **Not implemented** (ADR #15 — the one remaining high-leverage gap) |
-| Per-deployment `command_hash` salt | **Partial** — still defaults to `"aegis-default-salt"` (ADR #13) |
+| Dynamic-plugin `.so` cryptographic signature/hash integrity gate | **Not implemented** (ADR #15 — the one remaining high-leverage gap; a pre-`dlopen` path-ownership/permission gate *is* in place) |
+| Per-deployment `command_hash` salt | **Partial** — still defaults to `"aegis-default-salt"`, but the default is now flagged at startup (a `High` alert from `plugin-session`/`plugin-tty`; ADR #13) |
 | Static ABI-version mismatch on static plugins | **Warn-and-skip** (lenient; ADR #20 proposes a hard error) |
-| Static musl build config (`.cargo/config.toml`, `BUILD.md`) | **Verify** (CI relies on `musl-tools`; ADR #26) |
+| Static musl build config (`.cargo/config.toml`, `BUILD.md`) | **Done** — both exist (`.cargo/config.toml` pins the `musl-gcc` linker; `BUILD.md` is the build guide); ADR #26 |
 
 The agent↔server data path, the detection pipeline's first link (tty/pty capture),
 the persistence layer, the dashboard, enrollment, and the tamper-resistance
@@ -1126,9 +1137,9 @@ called out as Open/Partial.
 | 10 | **Implement the privileged installer** (binary copy, `FS_IMMUTABLE_FL` via ioctl, `systemctl enable`) and a real `guard` watchdog. | Required to actually achieve "an unprivileged user cannot uninstall, but root can." | high | **Done** (`install.rs` install/uninstall/guard; `O_NOFOLLOW`+`fchown`) |
 | 11 | **Expose a dropped-event counter / saturation metric.** | Silent telemetry loss can be induced to suppress a signature; operators need observability. | high | **Done** (`BusMetrics`, `RunningHost::bus_metrics()`) |
 | 12 | **Implement enrollment + per-agent Ed25519 identity.** | Gives each endpoint a cryptographic identity, enables mTLS session auth and the `Isolate` path. | high | **Done** (`enroll::enroll`, challenge-response auth) |
-| 13 | **Replace the default `hash_salt`** with a per-deployment salt; warn if the default is in use. | A shared default makes `command_hash` correlatable across all default deployments. | high | **Open** — still defaults to `"aegis-default-salt"` in `plugin-tty`/`plugin-session` |
+| 13 | **Replace the default `hash_salt`** with a per-deployment salt; warn if the default is in use. | A shared default makes `command_hash` correlatable across all default deployments. | high | **Partial** — the **warn-if-default half is done** (`plugin-session`/`plugin-tty` raise a `High` alert and `aegis-agent shell` logs a warning via `plugin_session::warn_on_default_salt`); the salt itself still defaults to `"aegis-default-salt"` and must be set per deployment |
 | 14 | **Add a persistent event store (redb).** | Server history was in-memory and reset on restart. | high/medium | **Done** (`store.rs`, `StoreSink`). Replaying history into live scores (`Rescore`) is still open. |
-| 15 | **Add an integrity gate to `load_dynamic`** (content hash allowlist and/or Ed25519 signature). | Dynamic plugins run in-process with full privileges; the ABI-version check authenticates nothing. | medium | **Open** — the single most significant remaining gap (loader has only a doc comment; enable-before-load, `catch_unwind`, allocator-correct free, and name-match are done) |
+| 15 | **Add an integrity gate to `load_dynamic`** (content hash allowlist and/or Ed25519 signature). | Dynamic plugins run in-process with full privileges; the ABI-version check authenticates nothing. | medium | **Partial** — a pre-`dlopen` **path-safety gate** landed (`load_dynamic` refuses a world-writable `.so`/dir, and a non-root-owned one when running as root); the **cryptographic** hash/signature gate is still the single most significant remaining gap (enable-before-load, `catch_unwind`, allocator-correct free, and name-match are also done) |
 | 16 | **Implement the operator dashboard (axum + rust-embed)** and control-plane surfacing. | The dashboard is where the trust boundary is enforced and where alerts are delivered. | medium | **Done** (`api.rs` + `dashboard.rs`). `aegisctl` control-plane subcommands still thin. |
 | 17 | **Add client-side batching + WAL in the forwarder** (size/age flush, idempotent on `batch_id`). | Per-event TLS writes are wasteful; a WAL prevents loss on restart before `BatchAck`. | medium | **Done** (ring buffer + disk spill with enforced cap in `plugin-transport`) |
 | 18 | **Populate `Score.features`** and **correlate `ProcessExec` risk with the session** instead of the disjoint `uid:{uid}` subject. | Score events were uninformative; agent-detected sessions never compound with that user's processes. | medium | **Partial** — `Score.features` now carries the risk decomposition; the `Detection`/`ProcessExec` subject namespaces are still disjoint |
@@ -1139,7 +1150,7 @@ called out as Open/Partial.
 | 23 | **Emit and consume `Heartbeat`** for agent liveness; alert on missed heartbeats. | The server must distinguish a graceful disconnect from a killed/tampered agent. | low | **Partial** — `plugin-tamper` emits `Heartbeat` each tick; server-side missed-heartbeat alerting still open |
 | 24 | **Move `plugin-process` from `/proc` polling toward inotify/eBPF** and TTL-evict the `seen` set. | Short-lived agent processes can be missed; clearing the cap set re-emits every process. | low | **Open** |
 | 25 | **Defer WASM plugin sandboxing.** Keep in-process plugins trusted; mitigate dynamic risk with #15. | The isolation benefit is marginal versus the cost; sensitive timing crosses the host boundary regardless. | low | **Deferred** (by decision) |
-| 26 | **Add `.cargo/config.toml` (musl linker) and write `BUILD.md`.** | CI builds `aegisd` for musl via `musl-tools` but there is no committed linker config to reproduce locally. | low | **Verify/Open** |
+| 26 | **Add `.cargo/config.toml` (musl linker) and write `BUILD.md`.** | CI builds `aegisd` for musl via `musl-tools`; a committed linker config + build guide let a fresh clone reproduce it locally. | low | **Done** — `.cargo/config.toml` pins the `musl-gcc` linker for the musl target and `docs/BUILD.md` is the build guide |
 
 ---
 

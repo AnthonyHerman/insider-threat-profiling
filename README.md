@@ -27,13 +27,19 @@ It is a **client/server** system:
   telemetry, runs central detection/scoring, and serves an operator dashboard.
 - **`aegisctl`** — the management CLI.
 
-## The core idea: everything is a plugin
+## The core idea: a feature-free kernel, with the bus as the seam
 
 The kernel (`aegis-core`) implements **no features**. It only discovers plugins,
 wires them onto a single event bus, routes events by subscription, and manages
-lifecycle. Every capability — telemetry collection, agent-vs-human detection,
-risk scoring, persistence, transport, and even the agent's self-protection — is a
-[`Plugin`](crates/aegis-sdk/src/plugin.rs). Plugins are discovered two ways:
+lifecycle. The processing surface is plugin-delivered: telemetry collection,
+agent-vs-human detection, risk scoring, transport, and the agent's self-protection
+are all [`Plugin`](crates/aegis-sdk/src/plugin.rs)s, and on the server *persistence*
+arrives as the store-sink plugin. The one deliberate exception is the server's
+**I/O drivers** — the TLS ingest listener and the operator HTTP API/dashboard are
+thin non-plugin modules wired *around* the bus (they hold a `RunningHost::emitter()`
+and the store handle) rather than registering as plugins. The invariant is "the
+kernel is feature-free and the bus is the seam," not "literally every line is a
+plugin." Plugins are discovered two ways:
 
 - **statically**, via `inventory` (a built-in plugin is auto-discovered just by
   being linked in), and
@@ -50,12 +56,16 @@ risk scoring, persistence, transport, and even the agent's self-protection — i
    │ Collectors                   │   │ Processors                     │
    │  plugin-process              │   │  plugin-agent-detect (flagship)│
    │  plugin-session (timing)     │   │  plugin-scoring                │
-   └──────────────────────────────┘   └───────┬───────────────────────┘
+   │  plugin-tty (pty/pipe)       │   └───────┬───────────────────────┘
    ┌──────────────────────────────┐   ┌───────▼───────────────────────┐
    │ Control                      │   │ Sinks                          │
-   │  plugin-tamper (self-protect)│   │  storage · transport · alert   │
+   │  plugin-tamper (self-protect)│   │  plugin-transport · store-sink │
    └──────────────────────────────┘   └────────────────────────────────┘
 ```
+
+The server's *persistence* is the store-sink plugin shown above; its network
+ingress (TLS listener) and operator HTTP/dashboard are **non-plugin** I/O drivers
+wired around the same bus, not plugins.
 
 ## Workspace layout
 
@@ -67,11 +77,15 @@ risk scoring, persistence, transport, and even the agent's self-protection — i
 | `crates/aegis-agent` | Endpoint client binary (`aegis-agent`). |
 | `crates/aegis-server` | Self-contained server binary (`aegisd`). |
 | `crates/aegis-cli` | Management CLI (`aegisctl`). |
+| `crates/aegis-integration-tests` | In-process end-to-end pipeline tests (no public surface). |
+| `crates/example-plugin` | Reference dynamic (`cdylib`) plugin. |
 | `plugins/plugin-process` | Collector: process-execution telemetry. |
-| `plugins/plugin-session` | Collector: session + keystroke/command timing (content-free). |
+| `plugins/plugin-session` | Collector: session lifecycle + content-free command-statistics helpers. |
+| `plugins/plugin-tty` | Collector: PTY/pipe keystroke + command timing (content-free). |
 | `plugins/plugin-agent-detect` | Processor: **agent-vs-human** distinction. |
 | `plugins/plugin-scoring` | Processor: per-subject risk aggregation + alerting. |
 | `plugins/plugin-tamper` | Control: endpoint self-protection. |
+| `plugins/plugin-transport` | Sink: mTLS forwarder (agent → server). |
 
 ## Build & run
 

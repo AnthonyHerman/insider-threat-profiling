@@ -605,8 +605,10 @@ in `[workspace.dependencies]` are already musl-correct: `rustls`,
 ["ring", ...]`, so **no OpenSSL / aws-lc / native-tls** is pulled; `redb` and
 the HTTP stack are pure Rust. The musl target defaults to
 `target_feature = "crt-static"`, producing a `static-pie` binary with no
-dynamic loader, using rustc's bundled musl libc + `rust-lld` — no
-`.cargo/config.toml` or `RUSTFLAGS` needed.
+dynamic loader. A committed `.cargo/config.toml` pins the musl **linker** to
+`musl-gcc` (from `musl-tools`) so the build needs no per-invocation `RUSTFLAGS`;
+the only external prerequisite is a musl-targeting C compiler for `ring` (see the
+build-env note below).
 
 > **`libloading` and `dlopen` — static-linking caveat.** `aegis-core` depends on
 > `libloading` for runtime plugin loading. On Linux, `libloading` links against
@@ -623,28 +625,35 @@ dynamic loader, using rustc's bundled musl libc + `rust-lld` — no
 > plugins as static `inventory` crates.
 
 ```sh
+# Standard route (matches CI): install musl-tools (provides musl-gcc), which the
+# committed .cargo/config.toml already pins as the linker. No CC override needed.
+sudo apt-get install -y musl-tools
+
 # Release (thin LTO, stripped, panic=abort — see [profile.release])
-CC_x86_64_unknown_linux_musl=clang \
-AR_x86_64_unknown_linux_musl=ar \
-CFLAGS_x86_64_unknown_linux_musl="--target=x86_64-unknown-linux-musl" \
 cargo build -p aegis-server --release --target x86_64-unknown-linux-musl
 
 # Distribution (fat LTO — [profile.dist])
-CC_x86_64_unknown_linux_musl=clang \
-AR_x86_64_unknown_linux_musl=ar \
-CFLAGS_x86_64_unknown_linux_musl="--target=x86_64-unknown-linux-musl" \
 cargo build -p aegis-server --profile dist --target x86_64-unknown-linux-musl
 ```
 
-> **Required build-env note (hard blocker if omitted).** `ring`'s build script
-> compiles a small C/asm component via `cc-rs` and needs a musl-capable C
-> compiler. This machine has **no** `x86_64-linux-musl-gcc`, so a naive
-> `cargo build --target …-musl` fails with
-> `failed to find tool "x86_64-linux-musl-gcc"`. Pointing `cc-rs` at the
-> installed `clang` via `CC_x86_64_unknown_linux_musl=clang` (with the matching
-> `CFLAGS`/`AR`) fixes it. Bake these into CI (or a `[env]` block in
-> `.cargo/config.toml`, or install `musl-cross`). The pure-Rust crates need no C
-> compiler — only `ring` does.
+> **Build-env note (musl C compiler for `ring`).** `ring`'s build script compiles
+> a small C/asm component via `cc-rs` and needs a musl-targeting C compiler; the
+> pure-Rust crates need none. The **standard route** (used by CI and the
+> Dockerfile) is to install `musl-tools`, which provides `musl-gcc`; `cc-rs`
+> auto-detects it and the committed `.cargo/config.toml` pins it as the linker, so
+> `cargo build --target …-musl` works with no env overrides. On a host that has
+> **`clang` but not `musl-tools`**, point both the linker and `cc-rs` at clang
+> instead:
+> ```sh
+> CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=clang \
+> CC_x86_64_unknown_linux_musl=clang \
+> AR_x86_64_unknown_linux_musl=ar \
+> CFLAGS_x86_64_unknown_linux_musl="--target=x86_64-unknown-linux-musl" \
+> cargo build -p aegis-server --release --target x86_64-unknown-linux-musl
+> ```
+> Only a host that has *neither* `musl-gcc`/`musl-tools` *nor* `clang` is blocked
+> (the naive build then fails with `failed to find tool "x86_64-linux-musl-gcc"`);
+> install one of them.
 
 Result (empirically): `ELF 64-bit … static-pie linked, stripped`, `ldd` =
 "statically linked", no `INTERP`/`NEEDED`/`RUNPATH`. Size with storage + TLS +

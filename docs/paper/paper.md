@@ -436,9 +436,11 @@ registration via the `register_plugin!` macro, which uses the `inventory` crate'
 distributed-slice mechanism: the macro submits a registration record at link time,
 and the kernel iterates the resulting slice at startup. Linking a plugin crate into
 a binary with `use plugin_x as _;` is the complete integration step — no registry
-file and no explicit registration call are required. The five built-in plugins
-(`plugin-process`, `plugin-session`, `plugin-agent-detect`, `plugin-scoring`,
-`plugin-tamper`) all register this way.
+file and no explicit registration call are required. The seven built-in plugins
+(`plugin-process`, `plugin-session`, `plugin-tty`, `plugin-agent-detect`,
+`plugin-scoring`, `plugin-tamper`, `plugin-transport`) all register this way:
+`plugin-tty` is the PTY/pipe keystroke- and command-timing collector, and
+`plugin-transport` is the mTLS forwarder sink.
 
 Third-party plugins may be loaded at runtime as shared objects (`cdylib`). A dynamic
 plugin exports a C-ABI entrypoint (`aegis_plugin_entry`) returning a heap-allocated
@@ -465,13 +467,21 @@ calling `try_send` on every plugin whose subscription matches the event's kind.
 Because each plugin drains its own queue independently, a slow plugin back-pressures
 only itself and never head-of-line-blocks others.
 
-Both write points — the ingress `try_send` and the per-plugin fan-out `try_send`
-— are non-blocking and drop-on-full. On saturation, events are dropped and a
-warning is logged. There is no dropped-event counter, no dead-letter queue, and no
-back-pressure signal to the producer. This bounds memory under saturation but means
-that high-frequency telemetry can be silently lost, a property that matters for a
-detection system: undetected telemetry loss is indistinguishable from the absence of
-the monitored behavior.
+The bus distinguishes *critical* event kinds (`alert`, `detection`, `score`) from
+low-value telemetry. Critical kinds take a **non-droppable** path: the dispatcher
+`send().await`s a slot on each subscribed plugin's queue, so a flood of cheap
+keystroke telemetry cannot evict an alert or a detection. Low-value kinds are
+delivered with `try_send` and dropped on a full queue — but the drops are
+**counted**, not silent: a `BusMetrics` instance maintains per-cause atomic
+counters (`ingress_dropped_full`/`ingress_dropped_closed` at the ingress,
+`fanout_dropped_full` at the fan-out) exposed via `RunningHost::bus_metrics()`, and
+`aegisd` periodically logs any increase so loss is alertable. This bounds memory
+under saturation while keeping the safety-relevant events flowing. The residual,
+stated honestly, is that under extreme sustained load *low-value* telemetry can
+still be dropped (a biased loss, since critical kinds are protected) — which is
+exactly why the counters and a tunable `queue_depth` exist. (This corrects an
+earlier draft that described drop-on-full with "no counter"; see security-audit M10,
+fixed, and ADR #4/#11.)
 
 Every plugin emits through a `ScopedEmitter` — a per-plugin wrapper around the
 shared `BusEmitter` — which automatically stamps the `source` field with the
@@ -910,15 +920,18 @@ Live integration testing also surfaced two genuine defects that the in-process t
 
 ### Workspace Structure
 
-Aegis is implemented as a Rust workspace of nine crates organized into three
-layers. The foundation layer consists of `aegis-sdk`, which defines the stable
-public contracts — the `Event` model and the `Plugin` trait with its
-inventory-based registration macro — and `aegis-core`, the kernel that discovers
-plugins, manages their lifecycle, and routes events over a single internal bus.
-`aegis-proto` sits alongside these two, specifying the length-framed, versioned
-wire protocol used between agent and server. Neither `aegis-sdk` nor `aegis-core`
-implements any behavioral feature; they are deliberately thin so that all domain
-logic lives in plugins.
+Aegis is implemented as a Rust workspace of fifteen crates — eight
+infrastructure/binary crates and seven plugins — organized into three layers. The
+foundation layer consists of `aegis-sdk`, which defines the stable public contracts
+— the `Event` model and the `Plugin` trait with its inventory-based registration
+macro — and `aegis-core`, the kernel that discovers plugins, manages their
+lifecycle, and routes events over a single internal bus. `aegis-proto` sits
+alongside these two, specifying the length-framed, versioned wire protocol used
+between agent and server. Two more crates support development and testing —
+`aegis-integration-tests` (the in-process end-to-end pipeline tests) and
+`example-plugin` (a reference dynamic `cdylib` plugin). Neither `aegis-sdk` nor
+`aegis-core` implements any behavioral feature; they are deliberately thin so that
+all domain logic lives in plugins.
 
 The binary layer contains three executables: `aegis-agent` (the endpoint client),
 `aegisd` (the server), and `aegisctl` (the management CLI). The agent embeds every
@@ -926,12 +939,14 @@ plugin it uses at link time via the `inventory` static discovery mechanism, so
 there is no runtime asset directory and no external plugin resolver to compromise.
 The server follows the same discipline for its own plugins.
 
-The plugin layer provides all operational capability as five crates:
-`plugin-process` (process-execution telemetry), `plugin-session` (session and
-inter-keystroke timing, content-free), `plugin-agent-detect` (the flagship
-agent-vs-human classifier, described in Sections 3–5), `plugin-scoring`
-(per-subject risk aggregation and alerting), and `plugin-tamper` (endpoint
-self-protection). The kernel dispatches events to subscribers by kind string;
+The plugin layer provides all operational capability as seven crates:
+`plugin-process` (process-execution telemetry), `plugin-session` (session lifecycle
+and the content-free command-statistics helpers), `plugin-tty` (PTY/pipe
+keystroke- and command-timing capture, content-free), `plugin-agent-detect` (the
+flagship agent-vs-human classifier, described in Sections 3–5), `plugin-scoring`
+(per-subject risk aggregation and alerting), `plugin-tamper` (endpoint
+self-protection), and `plugin-transport` (the mTLS forwarder sink). The kernel
+dispatches events to subscribers by kind string;
 plugins declare subscriptions in their `Plugin` implementation and never hold a
 reference to any other plugin, making the dependency graph explicit and the
 system incrementally extensible without modifying core [karantzas2021edr].
@@ -1104,11 +1119,11 @@ Aegis is a behavioral-surveillance tool with tamper resistance, a combination th
 
 **No rootkit techniques.** Aegis uses only standard OS mechanisms: root-owned files, the Linux immutable attribute (`FS_IOC_SETFLAGS`), and a systemd watchdog pair. The implementation explicitly forbids process hiding, syscall-table or LSM tampering, and `/proc` masking [wright2002lsm, loscocco2001selinux]. The agent is always visible to root via `ps`, `systemctl`, and on disk.
 
-**Content-free telemetry by design.** `EventPayload::Keystroke` carries only inter-arrival timing, paste/burst shape, and burst length — never characters. Commands are summarized structurally (token count, Shannon entropy, backspace flag) plus a salted SHA-256 `command_hash` for cross-session correlation without content. The salt is a protected asset that gates de-anonymization; stealing it (via ptrace or a forged server config command) would be the only path to re-identifying what is deliberately kept content-free. This design limits how invasive a deployment can be even in the hands of a determined operator.
+**Content-free telemetry by design.** `EventPayload::Keystroke` carries only inter-arrival timing, paste/burst shape, and burst length — never characters. Commands are summarized structurally (token count, Shannon entropy, backspace flag) plus a salted SHA-256 `command_hash` for cross-session correlation without content. The salt is a protected asset that gates de-anonymization; stealing it (via ptrace or a forged server config command) would be the only path to re-identifying what is deliberately kept content-free. The single field that *can* carry content — `ProcessExec.cmdline` (full process argv) — is **off by default** behind an explicit `cmdline_capture` opt-in on `plugin-process`; with it off, process telemetry is reduced to `argv[0]` (the program path, already implied by `exe`). This design limits how invasive a deployment can be even in the hands of a determined operator.
 
 **Explainability and corroboration before action.** The classifier is a transparent additive model; every verdict is attributed to named features via `Detection::reasons`, which is important for a tool whose output may trigger an HR or access-revocation action [cappelli2012cert, ball2021monitoring]. The security audit identified that false-positive injection attacks (forging a `Detection{Agent, 1.0}` event to frame an innocent user) are a realistic adversary goal [biggio2018]; authenticating telemetry origin and requiring server-side corroboration before acting on a single detection are therefore ethical controls as much as security ones.
 
-**Scope and consent.** Aegis is designed for environments where monitoring is disclosed and lawful — managed corporate endpoints with explicit employment agreements. The content-free design limits collateral privacy exposure even in compliant deployments, but operators remain responsible for legal and ethical compliance with applicable law. The system does not include any content-capture path that could be repurposed for covert personal surveillance.
+**Scope and consent.** Aegis is designed for environments where monitoring is disclosed and lawful — managed corporate endpoints with explicit employment agreements. The content-free design limits collateral privacy exposure even in compliant deployments, but operators remain responsible for legal and ethical compliance with applicable law. The keystroke/command and session schemas have no content-capture path — there is nowhere to put characters. The lone exception, `ProcessExec.cmdline`, is off by default and gated behind an explicit `cmdline_capture` opt-in (and the secret-exposure surface tracked as P6); with the default configuration there is no content-capture path that could be repurposed for covert personal surveillance.
 
 ---
 

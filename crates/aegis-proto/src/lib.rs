@@ -59,8 +59,20 @@ pub enum ProtoError {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ServerCommand {
     /// Ask the agent to re-evaluate detection for a subject.
+    ///
+    /// Today this is a **fire-and-forget stub**: the agent acks `ok:true` and
+    /// emits one local `transport.rescore` Custom trigger event, but no plugin in
+    /// the workspace subscribes to that kind, so the full re-scoring orchestration
+    /// is deferred. The emitted shape is fixed (see
+    /// `plugin_transport::actor::dispatch_command`) so a future consumer can key
+    /// on it without a wire change.
     Rescore { subject: String },
     /// Push a new configuration subtree to a named plugin.
+    ///
+    /// **Reserved wire field with no live implementation:** there is no
+    /// `Plugin::reconfigure` in `aegis-sdk`, so the agent always acks this
+    /// `ok:false` ("unsupported") and changes no state. Defined here so the
+    /// protocol is forward-compatible once live reconfiguration lands.
     SetConfig {
         plugin: String,
         config: serde_json::Value,

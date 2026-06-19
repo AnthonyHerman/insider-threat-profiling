@@ -194,7 +194,7 @@ longer yields zero risk forever (see A5).
 | A3 | Synthetic typo+backspace | errorless-input (0.04) | One backspace (`0x7f`) in ~1-in-10 commands; `had_backspace` is a per-command bool | −0.137 in old model | Demoted; replace bool with correction **dynamics**; lower slope/raise centre from real data; treat too-uniform corrections as anti-mimicry signal | high |
 | A4 | Paste avoidance | paste-injection (0.04) + whole-line-injection (0.12) | Per-character `write()`s; disable bracketed paste (no `ESC[200~`) | −0.140 in old model | `paste_ratio` demoted but `whole_line_paste_ratio` (0.12) and the `reaction_floor_hits >= 0.25 && whole_line >= 0.5` hard rule catch whole-line delivery; detect sub-human minimum flight-time (<~30ms); HID correlation | high |
 | A5 | **Dead-band camping** | exploits thresholds, not features | Tune any subset so `p_agent∈(0.35,0.62)` | n/a (no fidelity needed) | **Now mitigated:** `plugin-scoring` makes sustained `Uncertain` *actionable* — a small, decaying `uncertain_detection_weight` increment that, on a session that keeps re-emitting `Uncertain` (where its confidence peaks), accumulates faster than it decays and climbs to an alert (the pipeline test documents this). A single `Uncertain` still decays away harmlessly. Hysteresis/SPRT across re-assessments (`log_likelihood_ratio`) further hardens it | **medium** (was high) |
-| A6 | Direct telemetry forgery on the bus | bypasses input shaping | Side-loaded plugin emits a perfect human stream for a guessable `USER:pid` session_id | total | **`source`/`agent_id` forgery is now blocked** by the per-plugin `ScopedEmitter` (host-asserted). Remaining: the `session_id` is still `user:pid`-shaped (guessable), and there is no per-kind producer ACL (any loaded plugin may still emit input/Detection events for a valid subject); unguessable random-UUID session_id and a producer ACL would close it | **medium** (was high) |
+| A6 | Direct telemetry forgery on the bus | bypasses input shaping | Side-loaded plugin emits a perfect human stream for a target session_id | total | **`source`/`agent_id` forgery is now blocked** by the per-plugin `ScopedEmitter` (host-asserted), and the **`session_id` is now an unguessable random UUIDv4** (`plugin_session::new_session_id`; was the enumerable `user:pid`), so an attacker can no longer target a specific victim's accumulator by guessing its id. Remaining: there is no per-kind producer ACL (any loaded plugin may still emit input/Detection events under its *own* attributed name); a producer ACL would close the last edge | **medium** (was high) |
 | A7 | Evidence-gate starvation | exploits `MIN_KEYSTROKES=12`/`MIN_COMMANDS=3` | Work in <3 commands / one pipeline; churn short-lived `pid`-keyed sessions; emit under a session never started/ended | total (no verdict ever) | Accumulate evidence per **user/host**, not just session_id; treat high rate of ultra-short sessions as its own risk feature; score non-interactive command bursts. (The per-session memory DoS this also implied is now fixed: `Vec`s capped at `SAMPLE_CAP`) | **high** |
 | A8 | White-box tuning of entropy/cadence tails | dense-commands (0.02), regular-cadence (0.04) | Pad low-entropy whitespace; irregular cadence so `cadence_regularity` stays low | −0.037, −0.075 in old model | Both further **demoted**; keep the interface transparent but ship per-deployment coefficients off the endpoint; **move final classification server-side**; non-additive ensemble with feature interactions; anti-mimicry meta-feature | medium |
 
@@ -231,7 +231,7 @@ checklist; the **Status** notes which mitigations are now in code versus residua
 | P3 | False detection injection (emit `Detection{subject,Agent,0.99}`; scoring adds `60*0.99≈59.4`, two hits cross 75.0) | Frame any user as an AI agent → `High`/`Critical` alert, possible `Isolate`; or flood for alert fatigue | Host now **asserts `source`/`agent_id`** per plugin (`ScopedEmitter`), so impersonation/identity-forgery is closed. Remaining: a **per-kind producer ACL** (only a `Processor` may emit `Detection`) is still absent; sign `Detection`/`Alert`; rate-limit per source; server corroboration with session telemetry | **medium** — source/identity asserted; kind-ACL still open |
 | P4 | Tamper-alert suppression (flood the ingress so the tamper `Critical` is dropped pre-fan-out) | Previously: server gets no tamper notification. **Now blunted:** tamper alerts are `alert`-kind, on the non-droppable critical path | A dedicated high-priority channel would harden further; the SHA-256 manifest baseline already catches in-place replacement; server-enforced signed integrity-digest heartbeat | low — **critical-kind back-pressure + content-integrity baseline implemented** |
 | P5 | Host crash via `panic!`/`std::process::exit`/`abort` in plugin code | Process termination. The guardian is now a real watchdog (no longer a stub), so it plus systemd `RestartSec=1` recovers; a tight crash loop could still trip `StartLimitBurst` | `Guard` is **implemented** as a real liveness watchdog; `catch_unwind` now wraps the FFI entrypoint and every constructor; subprocess isolation for dynamic plugins and `StartLimit*` tuning still future | low — **real guardian + catch_unwind implemented** |
-| P6 | Full event-stream exfiltration via `Subscriptions::All` (the dispatcher clones every event; `ConsoleSink`/`plugin-transport` use this pattern) | A malicious sink reads every `SessionStart`/`CommandObserved`/`ProcessExec.cmdline` and forwards out-of-band; `cmdline` may contain secrets | Plugin capability manifest (`network.egress`, `subscribe.all`) enforced via seccomp; block `Subscriptions::All` in prod without explicit approval; network-namespaced subprocesses; secrets-aware `cmdline` redaction | low — still future |
+| P6 | Full event-stream exfiltration via `Subscriptions::All` (the dispatcher clones every event; `ConsoleSink`/`plugin-transport` use this pattern) | A malicious sink reads every `SessionStart`/`CommandObserved`/`ProcessExec.cmdline` and forwards out-of-band; `cmdline` may contain secrets | **`cmdline` content is now off by default** (`plugin-process` `cmdline_capture`, default false → only `argv[0]` is emitted), so there is no command-line content on the bus to exfiltrate unless an operator opts in. Still future for the broader stream: plugin capability manifest (`network.egress`, `subscribe.all`) enforced via seccomp; block `Subscriptions::All` in prod without explicit approval; network-namespaced subprocesses | low — **`cmdline` redaction default-on**; capability manifest still future |
 | P7 | ABI/type confusion via mismatched `#[repr(C)] DynPluginRegistration` with a correct `api_version` integer | Wrong struct layout → garbage function-pointer call → controlled jump = root code execution | The cross-allocator `Box::from_raw` UB is **fixed** (the host copies the `Copy` fields and frees via the plugin's paired `DYN_FREE_SYMBOL`), and an unwind across the entrypoint is contained by `catch_unwind`. Still recommended: a struct-layout hash alongside `PLUGIN_API_VERSION`, a signed manifest binding the exact SDK version, prefer static-only in prod | low — **`Box::from_raw`/panic fixed**; layout-hash still future |
 | P8 | Session-state memory exhaustion (co-located): emit `SessionStart`/`Keystroke` with random `session_id` in a loop | Previously: unbounded `sessions` growth → OOM. **Now bounded:** per-session sample `Vec`s are capped at `SAMPLE_CAP=2048` (rolling window) and sessions are removed on `session.end` | Per-source `session.start` rate-limit and a session-count cap would harden further | low — **per-session Vec bound implemented** |
 
@@ -436,12 +436,12 @@ choice noted below.
 | Per-agent Ed25519 session auth + clock window | N2, N3, N4, N5 | `aegis-proto`, `plugin-transport`, `aegis-server` | Resistance | **Implemented** (challenge-response + `ts_ns` clamp); per-batch sequence/per-command signature future |
 | Token single-use (atomic burn), TTL, length-bounded | N7 | `aegis-server` (`enroll`) | Resistance | **Implemented** |
 | Server heartbeat-deadline gap alert; agent `BatchAck` timeout | N8, U8 | `aegis-server`, `plugin-transport` | Detection | Partial (`Heartbeat` emitted + spill re-queue; server gap alert future) |
-| Plugin signature verification before `dlopen`; layout-hash in ABI | P1, P7, U9 | `aegis-core` (`loader.rs`) | Resistance | **Open** (the key remaining gap, ADR #15) |
+| Plugin signature verification before `dlopen`; layout-hash in ABI | P1, P7, U9 | `aegis-core` (`loader.rs`) | Resistance | **Partial** — a pre-`dlopen` path-safety gate landed (`load_dynamic` refuses a world-writable `.so`/dir, and a non-root-owned one when running as root); the **cryptographic** signature/hash check is still the key remaining gap (ADR #15) |
 | Per-plugin rate-limit + non-droppable path for `Critical` | P2, P4 | `aegis-core` (`bus.rs`, `host.rs`) | Resistance/Detection | **Implemented** (critical-kind back-pressure + `BusMetrics`); per-plugin rate-limit future |
 | Plugin-kind ACL on `Detection`/`Alert`; assert `event.source` | P3, A6 | `aegis-core` (`bus.rs` `ScopedEmitter`) | Resistance | `source`/`agent_id` assertion **implemented**; per-kind producer ACL future |
 | Subprocess + seccomp + network-ns isolation; capability manifest | P1, P5, P6 | `aegis-core` (plugin-runner) | Resistance | Future (panic isolation via `catch_unwind` landed) |
 | Per-plugin numeric bounds on pushed/loaded config | N3 | `aegis-core`, each plugin `init` | Resistance | Partial (`decay`/`ewma_alpha` validated; full schema future) |
-| Unguessable random-UUID `session_id` | A6 | collector (`plugin-tty`/`plugin-session`) | Resistance | **Open** (`session_id` still `user:pid`-shaped) |
+| Unguessable random-UUID `session_id` | A6 | collector (`plugin-tty`/`plugin-session`) | Resistance | **Implemented** (`plugin_session::new_session_id` = random UUIDv4; no longer `user:pid`-shaped) |
 
 ---
 
@@ -474,8 +474,13 @@ to do, and are enforced in code.
    correlation without content. This is now actually produced by `plugin-tty`, whose
    `Analyzer` reconstructs each line in a transient buffer **only** to compute those
    statistics and then discards it — the content-free invariant is structural, not
-   merely a policy. The salt is a protected asset precisely because it gates
-   de-anonymization (and it still defaults to a shared value — ADR #13).
+   merely a policy. **The one carve-out is `ProcessExec.cmdline`** (full process
+   argv, which can carry paths/secrets): it is content, so it is **off by default**
+   behind an explicit `cmdline_capture` opt-in on `plugin-process` (the default emits
+   only `argv[0]`); see P6. The salt is a protected asset precisely because it gates
+   de-anonymization; a deployment left on the public default is now flagged at
+   startup (a `High` alert from the collectors / a warning from `aegis-agent shell`),
+   so the per-deployment salt is enforced rather than merely advised (ADR #13).
 5. **Explainability.** The classifier is a transparent additive model whose every
    verdict is attributable to named features (and to any fired hard rule) via
    `Detection::reasons` — important for an insider-threat tool where a verdict may
@@ -533,7 +538,11 @@ guardrails constrain *the operator*, not just external adversaries:
 - **Consent and scope must be explicit.** Aegis is intended for environments where
   monitoring is disclosed and lawful (managed corporate endpoints). The content-free
   design (A5) is a deliberate limit on how invasive deployment *can* be — there is no
-  keystroke-content capture path to abuse.
+  keystroke-content capture path to abuse. The one field that can carry content,
+  `ProcessExec.cmdline`, is **off by default** behind an explicit `cmdline_capture`
+  opt-in on `plugin-process` (default emits only `argv[0]`), so a deployment cannot
+  passively collect command-line content (and its secrets, P6) without consciously
+  enabling it.
 - **The root-uninstall backdoor is the operator's accountability anchor.** Because
   removal is always possible by the machine owner / administrator (Guardrail 2),
   Aegis cannot become covert spyware that the legitimate owner cannot evict. Any
@@ -553,7 +562,11 @@ guardrails constrain *the operator*, not just external adversaries:
   misjudgment.
 - **Salt secrecy protects subjects, not just the system.** The `command_hash` salt
   (A5) keeps command correlation unlinkable across deployments; protecting it (U7,
-  N3) prevents an abuser from de-anonymizing what is meant to be content-free.
+  N3) prevents an abuser from de-anonymizing what is meant to be content-free. A
+  deployment left on the **public default** salt would silently degrade this to zero,
+  so it is now *enforced rather than advised*: `plugin-session` and `plugin-tty` raise
+  a `High` alert (and the `aegis-agent shell` subcommand logs a prominent warning) on
+  startup if `hash_salt == "aegis-default-salt"` (`plugin_session::warn_on_default_salt`).
 
 ---
 
@@ -576,15 +589,20 @@ features are still derived from a userspace stream and classified on the endpoin
 **What remains** (ordered by leverage):
 
 1. **Dynamic-loader integrity gate** (`aegis-core`) — Ed25519/hash verification of a
-   `.so` before `dlopen`, plus path-ownership checks. The single most significant
-   open hardening item (ADV-P P1, ADR #15).
+   `.so` before `dlopen`. The path-ownership half has landed (`load_dynamic` rejects
+   a world-writable `.so`/directory, and a non-root-owned one under root); the
+   **cryptographic** verification against a pinned key remains the single most
+   significant open hardening item (ADV-P P1, ADR #15).
 2. **Strategy-space hardening of detection** (`plugin-agent-detect`/`aegis-server`) —
    move the production decision boundary server-side and toward un-forgeable
-   (eBPF/HID) signals; add a per-kind producer ACL on the bus and an unguessable
-   `session_id`.
+   (eBPF/HID) signals; add a per-kind producer ACL on the bus. (The unguessable
+   random-UUID `session_id` half of this item is **done**.)
 3. **App-level wire hardening** (`aegis-proto`/`aegis-server`) — per-batch sequence
    numbers, a per-`Command` signature, and a server-side missed-heartbeat gap alert.
 4. **Per-deployment `command_hash` salt** (ADR #13) — replace the shared default.
+   Now *enforced rather than only advised*: `plugin-session`/`plugin-tty` raise a
+   `High` alert (and `aegis-agent shell` warns) when the public default salt is in
+   use; replacing it per deployment remains an operator action.
 5. **Operational hardening** — per-source rate limits, `StartLimit*` tuning, and the
    smaller items tracked in `docs/security-audit.md`.
 

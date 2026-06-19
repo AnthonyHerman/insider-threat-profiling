@@ -18,3 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# Opaque, unguessable session identifiers (random UUIDv4) so a co-located process
+# cannot enumerate/forge a victim's session_id (THREAT_MODEL §4.2 A6).
+uuid.workspace = true

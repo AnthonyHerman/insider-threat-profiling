@@ -24,6 +24,11 @@ aegis-sdk = { workspace = true }
 # aegis-sdk, so no dynamic loading or `inventory` is needed.
 plugin-agent-detect = { path = "../../plugins/plugin-agent-detect" }
 plugin-scoring = { path = "../../plugins/plugin-scoring" }
+# Collector plugins, exercised end-to-end (collector → bus → sink) in
+# collectors.rs to prove the collector wiring — not just the central
+# processors — is intact over the real host.
+plugin-process = { path = "../../plugins/plugin-process" }
+plugin-session = { path = "../../plugins/plugin-session" }
 # CapturingSink implements the async `Plugin` trait.
 async-trait = { workspace = true }
 # Multi-threaded runtime so the dispatcher and per-plugin handler tasks make

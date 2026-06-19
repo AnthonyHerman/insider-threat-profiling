@@ -54,6 +54,7 @@ dependencies = [
  "criterion",
  "futures",
  "inventory",
+ "libc",
  "libloading",
  "serde",
  "serde_json",
@@ -72,7 +73,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "plugin-agent-detect",
+ "plugin-process",
  "plugin-scoring",
+ "plugin-session",
  "serde_json",
  "tokio",
 ]
@@ -1338,6 +1341,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
