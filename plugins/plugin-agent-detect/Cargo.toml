@@ -16,3 +16,20 @@ tracing.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# `async_tokio` is needed for the end-to-end detector bench, which drives the
+# plugin's async `handle` through a tokio runtime.
+criterion = { workspace = true, features = ["async_tokio"] }
+
+[[bench]]
+name = "assess"
+harness = false
+
+[[bench]]
+name = "features"
+harness = false
+
+[[bench]]
+name = "detect_e2e"
+harness = false

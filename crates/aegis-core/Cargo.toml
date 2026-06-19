@@ -24,3 +24,10 @@ futures.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
+# `async_tokio` lets the dispatch bench drive the real Host (run/emit/shutdown)
+# through a tokio runtime.
+criterion = { workspace = true, features = ["async_tokio"] }
+
+[[bench]]
+name = "dispatch"
+harness = false

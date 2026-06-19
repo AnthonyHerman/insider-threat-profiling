@@ -181,6 +181,22 @@ fn build_example_plugin_so() -> PathBuf {
     path
 }
 
+/// Locate an already-built `libexample_plugin` shared object next to this test
+/// binary, without invoking cargo. Under `cargo test --workspace` (what CI runs)
+/// the `example-plugin` cdylib is already built as a workspace member, so we can
+/// just point at it — avoiding a NESTED `cargo build` during `cargo test`, which
+/// contends on the target-directory build lock and is fragile/hangs in CI.
+///
+/// The test binary lives at `<target>/<profile>/deps/<bin>`, so the sibling
+/// dylib is at `<target>/<profile>/libexample_plugin<suffix>`. This naturally
+/// honors `CARGO_TARGET_DIR` because `current_exe()` already reflects it.
+fn locate_prebuilt_so() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?; // <target>/<profile>
+    let candidate = profile_dir.join(format!("libexample_plugin{DYLIB_SUFFIX}"));
+    candidate.exists().then_some(candidate)
+}
+
 /// Poll the captured buffer until `pred` holds or `timeout` elapses.
 async fn wait_for<F>(captured: &Arc<Mutex<Vec<Event>>>, timeout: Duration, pred: F) -> bool
 where
@@ -221,7 +237,10 @@ fn is_marker_event(e: &Event) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dynamic_cdylib_plugin_loads_and_runs() {
     // 1. Build + locate the third-party shared object.
-    let so_path = build_example_plugin_so();
+    // Prefer the artifact the workspace build already produced (no nested cargo,
+    // so CI's `cargo test --workspace` does not deadlock on the build lock);
+    // fall back to building it for a standalone `cargo test -p ...` run.
+    let so_path = locate_prebuilt_so().unwrap_or_else(build_example_plugin_so);
 
     // 2. Build a host whose only sources are the dynamic plugin + a sink.
     let (sink, captured) = CapturingSink::new();

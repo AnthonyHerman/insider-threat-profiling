@@ -24,3 +24,10 @@ hex = { workspace = true }
 tokio = { workspace = true }
 rcgen = { workspace = true }
 proptest = { workspace = true }
+# `async_tokio` drives the real `write_message`/`read_message` framing path over
+# `tokio::io::duplex` in the through-the-API variant of the framing bench.
+criterion = { workspace = true, features = ["async_tokio"] }
+
+[[bench]]
+name = "framing"
+harness = false

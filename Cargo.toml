@@ -48,6 +48,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Property-based testing (dev-only)
 proptest = "1"
 
+# Micro-benchmarks (dev-only). Pinned to 0.5; the `async_tokio` feature is added
+# per-crate where a bench drives the real async framing/dispatch path.
+criterion = { version = "0.5", features = ["html_reports"] }
+
 # Identity / crypto (pure-Rust, musl friendly)
 uuid = { version = "1", features = ["v4", "serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
