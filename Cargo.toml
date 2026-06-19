@@ -45,6 +45,9 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Property-based testing (dev-only)
+proptest = "1"
+
 # Identity / crypto (pure-Rust, musl friendly)
 uuid = { version = "1", features = ["v4", "serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }

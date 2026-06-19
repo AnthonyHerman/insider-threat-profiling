@@ -6,16 +6,20 @@ insider-threat modeling**. Its flagship capability is distinguishing an
 *timing and structure* telemetry — never keystroke content.
 
 This document describes the architecture **as it exists in the source tree**.
-Where a capability is designed but not yet wired (for example the agent→server
-transport), it is called out explicitly so the diagrams are not mistaken for
-the running system. The roadmap of concrete next steps is at the end.
+The roadmap of concrete next steps is at the end.
 
-> Scope note: this is an active research prototype. The *kernel*, the *event
-> model*, the *plugin contract*, the *wire protocol*, and the *five built-in
-> plugins* are implemented and unit-tested. The network layer (TLS ingest,
-> forwarder), enrollment, persistence, the dashboard, and the privileged
-> installer are designed (types/protocol present) but not yet implemented in the
-> binaries. See [Implementation status](#implementation-status).
+> Scope note: this is an active research prototype, but the end-to-end platform
+> is now implemented and tested. The *kernel*, the *event model*, the *plugin
+> contract*, the *wire protocol*, and the *seven built-in plugins* are
+> implemented and unit-tested. The network layer (TLS 1.3 ingest listener,
+> mTLS+Ed25519 forwarder), enrollment, persistence (redb), the operator
+> dashboard, and the privileged installer/guardian are **implemented and
+> exercised** — including an end-to-end integration test that drives synthetic
+> keystroke/command telemetry through the real bus into a Detection → Score →
+> Alert (`crates/aegis-integration-tests/tests/pipeline.rs`). See
+> [Implementation status](#implementation-status). The genuinely open items are
+> a small set of hardening gaps tracked in the ADR (most prominently a
+> signature/hash integrity gate on dynamically loaded `.so` plugins).
 
 ---
 
@@ -57,8 +61,8 @@ The system is a three-binary client/server deployment:
 
 | Binary | Crate | Role |
 |--------|-------|------|
-| `aegis-agent` | `crates/aegis-agent` | Endpoint client. Runs collector + self-protection plugins; (designed) forwards telemetry; provides the tamper-resistant install lifecycle. |
-| `aegisd` | `crates/aegis-server` | Server. A single self-contained static binary that (designed) ingests telemetry, runs the central detection/scoring processors, and serves the operator dashboard. |
+| `aegis-agent` | `crates/aegis-agent` | Endpoint client. Runs collector + self-protection plugins; forwards telemetry over mTLS (`plugin-transport`); enrolls (`enroll` subcommand); provides the tamper-resistant install/uninstall/guard lifecycle and an instrumented `shell` subcommand. |
+| `aegisd` | `crates/aegis-server` | Server. A single self-contained static binary that ingests telemetry over a TLS-1.3 listener, runs the central detection/scoring processors, persists to an embedded redb store, and serves the operator HTTP API/dashboard. It binds both the `--listen` (ingest) and `--http` (API) sockets. |
 | `aegisctl` | `crates/aegis-cli` | Management CLI. Today: plugin introspection and version reporting. |
 
 ---
@@ -69,16 +73,25 @@ The system is a three-binary client/server deployment:
 crates/
   aegis-sdk     Stable contracts: Event model + Plugin trait/registration. No features.
   aegis-core    The kernel: plugin host, event bus, static + dynamic loaders, config.
-  aegis-proto   Wire protocol: length-prefixed JSON frames, agent↔server message grammar.
+  aegis-proto   Wire protocol + crypto: length-prefixed JSON frames, agent↔server
+                message grammar, TLS-1.3 config, SHA-256 cert pinning, Ed25519 auth.
   aegis-agent   Endpoint client binary (aegis-agent).
-  aegis-server  Self-contained server binary (aegisd).
+  aegis-server  Self-contained server binary (aegisd): store, ingest, enroll, api, dashboard.
   aegis-cli     Management CLI (aegisctl).
+  aegis-integration-tests  End-to-end pipeline + dynamic-loader tests over the real bus.
+  example-plugin           Reference out-of-tree plugin.
 plugins/
   plugin-process       Collector: process-execution telemetry (/proc sampler).
-  plugin-session       Collector: session lifecycle + content-free command/keystroke stats.
+  plugin-session       Collector: session lifecycle (SessionStart) + content-free
+                       command/keystroke summary helpers reused by other collectors.
+  plugin-tty           Collector: interactive-shell keystroke/command telemetry via a
+                       PTY (shell mode) or a timestamped pipe (CI mode); content-free.
   plugin-agent-detect  Processor: the agent-vs-human distinction (flagship).
   plugin-scoring       Processor: per-subject decaying risk aggregation + alerting.
-  plugin-tamper        Control: endpoint self-protection (posture + tamper watch + install spec).
+  plugin-tamper        Control: endpoint self-protection (posture + content-integrity
+                       tamper watch + privileged installer/guardian).
+  plugin-transport     Sink: mTLS forwarder to the server (ring buffer + disk spill,
+                       Ed25519 session auth); Subscriptions::All.
 ```
 
 Dependency direction (arrows point at the dependency):
@@ -88,14 +101,16 @@ graph LR
   subgraph Plugins
     PP[plugin-process]
     PS[plugin-session]
+    PTTY[plugin-tty]
     PAD[plugin-agent-detect]
     PSC[plugin-scoring]
     PT[plugin-tamper]
+    PTR[plugin-transport]
   end
 
   SDK[aegis-sdk\ncontracts]
   CORE[aegis-core\nkernel]
-  PROTO[aegis-proto\nwire protocol]
+  PROTO[aegis-proto\nwire protocol + crypto]
 
   AGENT[aegis-agent\nbin]
   SERVER[aegisd\nbin]
@@ -106,15 +121,20 @@ graph LR
 
   PP --> SDK
   PS --> SDK
+  PTTY --> SDK
   PAD --> SDK
   PSC --> SDK
   PT --> SDK
+  PTR --> SDK
+  PTR --> PROTO
 
   AGENT --> CORE
   AGENT --> PROTO
   AGENT --> PP
   AGENT --> PS
+  AGENT --> PTTY
   AGENT --> PT
+  AGENT --> PTR
 
   SERVER --> CORE
   SERVER --> PROTO
@@ -129,6 +149,9 @@ graph LR
   CLI --> PSC
   CLI --> PT
 ```
+
+`plugin-transport` is the one plugin that depends on `aegis-proto` (it speaks the
+wire protocol); all other plugins depend only on `aegis-sdk`.
 
 A binary "links in" a plugin with `use plugin_x as _;`. The empty import forces
 the linker to include the crate, which runs its `inventory::submit!` so the
@@ -158,43 +181,49 @@ flowchart TB
   subgraph COL["Collectors (Subscriptions::None — produce only)"]
     PP["plugin-process\nProcessExec"]
     PS["plugin-session\nSessionStart (+ command/keystroke helpers)"]
+    PTTY["plugin-tty\nKeystroke/CommandObserved (PTY/pipe)"]
   end
 
   subgraph PROC["Processors"]
     PAD["plugin-agent-detect\nKeystroke/CommandObserved -> Detection"]
-    PSC["plugin-scoring\nDetection/ProcessExec -> Score, Alert"]
+    PSC["plugin-scoring\nDetection/ProcessExec/SessionEnd -> Score, Alert"]
   end
 
   subgraph CTRL["Control"]
-    PT["plugin-tamper\nposture + tamper-watch -> Alert"]
+    PT["plugin-tamper\nposture + content-integrity watch -> Alert"]
   end
 
   subgraph SINK["Sinks"]
     CONSOLE["console-sink (agent --print-events)\nSubscriptions::All"]
-    FWD["plugin-forwarder (planned)\nbatch -> server"]
+    FWD["plugin-transport\nmTLS forward to server, Subscriptions::All"]
   end
 
   PP -- emit --> EMIT
   PS -- emit --> EMIT
+  PTTY -- emit --> EMIT
   PT -- emit --> EMIT
   PAD -- emit --> EMIT
   PSC -- emit --> EMIT
 
   DISP -- "input.keystroke / command.observed / session.*" --> PAD
-  DISP -- "detection / process.exec / alert" --> PSC
+  DISP -- "detection / process.exec / session.end" --> PSC
   DISP -- "all kinds" --> CONSOLE
-  DISP -- "all kinds (planned)" --> FWD
+  DISP -- "all kinds" --> FWD
 ```
 
 Notes that match the code exactly:
 
-- Collectors (`plugin-process`, `plugin-session`) and `plugin-tamper` declare
-  `Subscriptions::None`: they are pure producers and run background tasks spawned
-  in `init()`.
+- Collectors (`plugin-process`, `plugin-session`, `plugin-tty`) and
+  `plugin-tamper` declare `Subscriptions::None`: they are pure producers and run
+  background tasks spawned in `init()`. `plugin-tty` defaults to `mode = "off"`
+  and is inert unless explicitly enabled (it would otherwise seize the terminal).
 - `plugin-agent-detect` subscribes to `input.keystroke`, `command.observed`,
   `session.start`, `session.end`.
-- `plugin-scoring` subscribes to `detection`, `process.exec`, `alert` (the
-  `alert` arm is currently a no-op — see [routing](#subscriptions-routing-and-back-pressure)).
+- `plugin-scoring` subscribes to `detection`, `process.exec`, `session.end`. The
+  `session.end` arm evicts the session's accumulated risk; there is no `alert`
+  subscription (the old no-op arm was removed).
+- `plugin-transport` subscribes to `Subscriptions::All` and forwards every event
+  to the server over mTLS.
 - `console-sink` is an inline `Plugin` defined in `aegis-agent/src/main.rs`,
   added via `HostBuilder::with_plugin` when `--print-events` is passed.
 
@@ -202,23 +231,23 @@ Notes that match the code exactly:
 
 ## Data flow: agent → server
 
-The wire protocol (`aegis-proto`) is fully specified and unit-tested. The
-network *plumbing* that uses it (a forwarder Sink on the agent, an ingest
-listener on the server) is **not yet implemented**. The diagram below shows the
-intended end-to-end flow; dashed boxes are designed-not-yet-built.
+The wire protocol (`aegis-proto`) is fully specified and unit-tested, and the
+network *plumbing* that uses it is implemented: a forwarder Sink on the agent
+(`plugin-transport`) and a TLS-1.3 ingest listener on the server
+(`aegis-server::ingest::serve`). The diagram below shows the end-to-end flow.
 
 ```mermaid
 sequenceDiagram
   participant Col as Collectors (agent)
   participant Bus as Agent bus (aegis-core)
-  participant Fwd as plugin-forwarder (planned)
-  participant Net as TLS / aegis-proto
-  participant Ing as plugin-ingest (planned, server)
+  participant Fwd as plugin-transport (agent)
+  participant Net as mTLS / aegis-proto
+  participant Ing as ingest::serve (server)
   participant SBus as Server bus (aegis-core)
   participant Proc as Processors (agent-detect, scoring)
-  participant Dash as Dashboard (planned)
+  participant Dash as Store + HTTP API/dashboard
 
-  Note over Col,Bus: One-time enrollment (designed in aegis-proto)
+  Note over Col,Bus: One-time enrollment (aegis-agent enroll → enroll::enroll)
   Fwd->>Net: EnrollRequest { token, hostname, os, agent_pubkey (Ed25519) }
   Net->>Ing: EnrollRequest
   Ing-->>Net: EnrollResponse { accepted, agent_id }
@@ -257,15 +286,19 @@ Key protocol facts (`crates/aegis-proto/src/lib.rs`):
 - Two-phase identity: `EnrollRequest`/`EnrollResponse` (first contact, one-time
   token, carries the agent's 32-byte Ed25519 public key) vs.
   `ClientHello`/`ServerHello` (per-session handshake on an already-enrolled
-  connection). Transport security (mTLS) and token auth are layered *under* this
-  protocol — the crate defines only the message grammar and framing.
+  connection). Transport security is layered under this grammar and **is now
+  implemented**: `aegis-proto::tls` builds a TLS-1.3-only config, `aegis-proto::pin`
+  pins the server cert by SHA-256 fingerprint, and the session is authenticated by
+  an Ed25519 challenge-response bound to the served leaf's pin (with RFC-5705
+  channel binding) — see `plugins/plugin-transport/src/actor.rs` and
+  `crates/aegis-server/src/ingest.rs`.
 - The server→agent control channel is `Message::Command { id, ServerCommand }`
   with `ServerCommand` = `Rescore`, `SetConfig`, `Isolate`, `Noop`; the agent
   replies with `CommandResult`.
 
 `aegis-proto` is intentionally **not** part of the in-process bus machinery — it
-is the transport-layer wire format, used by the (planned) forwarder and ingest
-plugins only. The two buses (agent and server) are entirely separate in-process
+is the transport-layer wire format, used by the `plugin-transport` forwarder and
+the server ingest listener only. The two buses (agent and server) are entirely separate in-process
 event buses bridged by the network.
 
 ---
@@ -380,7 +413,7 @@ Both paths converge on the same `PluginConstructor = fn() -> Box<dyn Plugin>`.
 distributed slice at link time. `inventory::collect!(PluginRegistration)` (in
 the SDK) is the collection point; the kernel iterates
 `inventory::iter::<PluginRegistration>` at startup. The SDK re-exports
-`inventory` so plugin crates need no direct `inventory` dependency. All five
+`inventory` so plugin crates need no direct `inventory` dependency. All seven
 built-in plugins register this way, e.g.:
 
 ```rust
@@ -388,13 +421,18 @@ register_plugin!("plugin-process", || Box::new(ProcessPlugin::default()));
 ```
 
 **Dynamic (cdylib):** a shared object exports a C-ABI entrypoint named by
-`DYN_ENTRY_SYMBOL` (`b"aegis_plugin_entry"`) with signature `DynEntry =
-unsafe extern "C" fn() -> *mut DynPluginRegistration`. The
-`#[repr(C)] DynPluginRegistration { api_version, constructor }` is returned
-across the ABI. `aegis-core::loader::load_dynamic(path)` looks up the symbol,
-null-checks the pointer, adopts it via `Box::from_raw`, validates
-`api_version == PLUGIN_API_VERSION`, and returns a `DynamicPlugin { library,
-constructor }` that keeps the `libloading::Library` mapped.
+`DYN_ENTRY_SYMBOL` (`b"aegis_plugin_entry"`) returning `*mut DynPluginRegistration`,
+**and** a paired free function named by `DYN_FREE_SYMBOL`. The
+`#[repr(C)] DynPluginRegistration { api_version, constructor }` is returned across
+the ABI. `aegis-core::loader::load_dynamic(path)` looks up both symbols (so it
+never calls the entrypoint without a way to free what it returns), wraps the
+entrypoint call in `catch_unwind` (an unwind across `extern "C"` is UB),
+null-checks the pointer, **copies the `Copy` fields out and hands the pointer back
+to the plugin's free function** — it does *not* take ownership via `Box::from_raw`,
+which would free the allocation with the host's allocator (UB across mixed
+toolchains). It then validates `api_version == PLUGIN_API_VERSION` and returns a
+`DynamicPlugin { library, constructor }` that keeps the `libloading::Library`
+mapped.
 
 ```mermaid
 flowchart LR
@@ -404,19 +442,26 @@ flowchart LR
     SLICE --> ITER["inventory::iter::<PluginRegistration>"]
   end
   subgraph Dynamic["Dynamic path (run-time)"]
-    SO[".so cdylib\nexports aegis_plugin_entry"] --> LOOK["load_dynamic():\nLibrary::new + symbol lookup"]
-    LOOK --> VER["api_version == PLUGIN_API_VERSION?"]
+    EN["is_enabled(name)?\n(checked BEFORE opening the library)"] --> SO[".so cdylib\nexports aegis_plugin_entry + free"]
+    SO --> LOOK["load_dynamic():\nLibrary::new + both symbols + catch_unwind(entry)"]
+    LOOK --> FREE["copy Copy fields, hand ptr back to free fn"]
+    FREE --> VER["api_version == PLUGIN_API_VERSION?"]
+    VER --> NAME["metadata name == declared name?"]
   end
   ITER --> CTOR["PluginConstructor\nfn() -> Box&lt;dyn Plugin&gt;"]
-  VER --> CTOR
-  CTOR --> HOST["HostBuilder::build()"]
+  NAME --> CTOR
+  CTOR --> HOST["HostBuilder::build() (catch_unwind around each ctor)"]
 ```
 
-> Safety: a dynamic `.so` runs **in-process with full host privileges**. The
-> ABI-version handshake catches gross mismatches but cannot make untrusted code
-> safe; `loader.rs` documents that only trusted, integrity-checked paths should
-> be loaded. There is currently **no** signature or content-hash check on the
-> path (see the ADR).
+> Safety: a dynamic `.so` runs **in-process with full host privileges**. The host
+> now checks enablement *before* opening the library (a disabled-but-listed path is
+> never `dlopen`ed), wraps the entrypoint and every constructor in `catch_unwind`,
+> rejects a `.so` whose reported metadata name does not match its declared name, and
+> frees the registration in the plugin's own allocator. The ABI-version handshake
+> still cannot make untrusted code *safe*, and there is currently **no signature or
+> content-hash integrity gate** on the path — `loader.rs` documents that only
+> trusted, integrity-checked paths should be loaded, but does not enforce it. This
+> is the most significant open hardening item (see the ADR).
 
 ### ABI version handling is asymmetric
 
@@ -458,7 +503,8 @@ stateDiagram-v2
     data_dir/<name> created (warn on failure).
     PluginContext built (Arc).
     plugin.init(&ctx) awaited serially;
-    an init error aborts startup.
+    an init error or panic skips that plugin
+    (warn-logged) without aborting startup.
   end note
 ```
 
@@ -474,8 +520,11 @@ Details from `crates/aegis-core/src/host.rs`:
 2. **Init.** `Host::run()` creates the ingress channel sized to
    `config.queue_depth`, then for each plugin: creates `data_dir/<name>`
    (`create_dir_all`; failure is warn-logged, not fatal), builds an
-   `Arc<PluginContext>`, and awaits `plugin.init(&ctx)` **serially**. An init
-   error aborts startup (`with_context` names the failing plugin).
+   `Arc<PluginContext>`, and awaits `plugin.init(&ctx)` **serially**. Both an
+   `Err` return and a panic during `init` are caught by `catch_unwind`, logged
+   at `warn`, and the plugin is **skipped** — one bad plugin does not abort
+   startup for the rest. (This is the M8 audit fix; previously an init error
+   would unwind `run`.)
 
 3. **Run.** After init, each plugin is converted to `Arc<dyn Plugin>` and gets
    its own bounded `mpsc::channel::<Event>(queue_depth)` drained by its own
@@ -521,33 +570,45 @@ only eventually consistent. This is acceptable for the current processors
 (scoring is decay-based and order-insensitive) but is a known limitation for any
 future plugin needing strict causal ordering.
 
-### Back-pressure: drop, don't block
+### Back-pressure: drop low-value telemetry, block on security-critical kinds
 
-Both write points are **non-blocking and drop-on-full**:
+The bus splits its two write points by event criticality. `is_critical_kind`
+(`bus.rs`) flags `alert`, `detection`, and `score`:
 
-- `BusEmitter::emit` (`bus.rs`) uses `try_send`; on `TrySendError::Full` it logs
-  `tracing::warn` and drops the event; on `Closed` it logs `tracing::debug`.
-- The dispatcher's per-plugin fan-out (`host.rs`) uses `try_send`; on `Full` it
-  logs `tracing::warn` and drops.
+- **Security-critical kinds (`alert`/`detection`/`score`)** take a *non-droppable*
+  path at the ingress: `BusEmitter::emit` uses `tx.send().await` (back-pressure —
+  await a slot) rather than dropping. This closes the "flood cheap telemetry to
+  evict the alert that would catch it" primitive: a burst of keystrokes can no
+  longer silently displace a `Detection`/`Alert`/`Score`.
+- **Low-value telemetry (everything else, e.g. `input.keystroke`, `heartbeat`)**
+  stays non-blocking: `emit` uses `try_send` and drops on a full queue, bounding
+  memory under saturation.
+- The dispatcher's per-plugin fan-out (`host.rs`) uses `try_send` and drops on a
+  full per-plugin queue.
+
+**Every drop is counted.** `BusMetrics` (`bus.rs`) holds lock-free atomic
+counters — `ingress_dropped` (full + closed) and `fanout_dropped` — exposed via
+`RunningHost::bus_metrics()`, so telemetry loss is observable and alertable rather
+than a silent log line. A `Closed` ingress drop (the shutdown window) now logs at
+`warn` with the event kind too.
 
 ```mermaid
 flowchart LR
-  P["Producer plugin\n(emit)"] -->|try_send| I{ingress full?}
-  I -- no --> D[dispatcher]
-  I -- "yes" --> X1["drop + warn"]
+  P["Producer plugin\n(emit)"] -->|critical kind?| K{alert/detection/score?}
+  K -- yes --> B["send().await\n(block until slot, never drop)"] --> D[dispatcher]
+  K -- no --> I{ingress full?}
+  I -- no --> D
+  I -- "yes" --> X1["drop + count + warn"]
   D -->|try_send per route| Q{plugin queue full?}
   Q -- no --> H[plugin handler task]
-  Q -- "yes" --> X2["drop + warn"]
+  Q -- "yes" --> X2["drop + count + warn"]
 ```
 
-This bounds memory under saturation but means high-frequency collectors can
-silently lose events. There is **no dropped-event counter, no dead-letter
-queue, and no back-pressure signal** to the producer — only log lines. For a
-detection system this matters: undetected telemetry loss is indistinguishable
-from the absence of that behavior, and biased loss (e.g. dropping fast
-keystrokes) would skew the `keystroke_cv` feature. Adding a drop counter is a
-high-priority item in the ADR. The single knob today is
-`HostConfig::queue_depth` (default `4096`).
+This bounds memory under saturation while guaranteeing delivery of the detection
+outputs. Biased loss of low-value telemetry (e.g. dropping fast keystrokes) could
+still skew the `keystroke_cv` feature under extreme load, which is why the drop
+counters exist and `HostConfig::queue_depth` (default `4096`) is tunable; the
+critical kinds are protected regardless of the queue depth.
 
 ---
 
@@ -565,20 +626,26 @@ flowchart TB
     SE["session.end"]
   end
 
+  subgraph COLL["plugin-tty (Collector, PTY/pipe)"]
+    TTY["content-free Analyzer\nemits Keystroke / CommandObserved"]
+  end
+
   subgraph AD["plugin-agent-detect (Processor)"]
-    ACC["SessionAccumulator (per session_id)\ninter_arrivals_ms, inter_commands_ms,\nentropies, keystrokes, pastes,\ncommands, backspace_commands"]
+    ACC["SessionAccumulator (per session_id)\nrolling Vecs capped at SAMPLE_CAP=2048\ninter_arrivals_ms, inter_commands_ms,\nentropies, keystrokes, pastes, commands, ..."]
     GATE{"enough_evidence?\nkeystrokes >= 12 AND commands >= 3"}
-    FV["FeatureVector\nkeystroke_cv, paste_ratio,\nmean_inter_command_ms, backspace_ratio,\nentropy_mean, cadence_regularity"]
-    MODEL["Model::assess\n6 weighted sigmoid terms"]
+    FV["FeatureVector (12 fields)\nTier-1 marginals + Tier-2/3 joint-structure\n(NaN below MIN_COMMANDS_ROBUST=16)"]
+    MODEL["Model::assess\n11 weighted sigmoid terms + 3 hard rules,\nthreshold 0.62"]
     DET["Detection event\nverdict, confidence,\nmodel = transparent-additive/v1,\nreasons (top-3), features"]
   end
 
   subgraph SC["plugin-scoring (Processor)"]
     RISK["RiskState.bump:\nnew = (old*decay + delta).clamp(0,100)"]
-    SCORE["Score event"]
+    SCORE["Score event (features = risk decomposition)"]
     ALERT["Alert event\nif score >= alert_threshold"]
   end
 
+  TTY --> K
+  TTY --> C
   K --> ACC
   C --> ACC
   SS -->|create session state| ACC
@@ -587,7 +654,8 @@ flowchart TB
   GATE -- yes --> FV --> MODEL --> DET
   SE -->|force assess, then remove| MODEL
 
-  DET -->|delta = weight * confidence| RISK
+  DET -->|"Agent: delta = weight*conf;\nsustained Uncertain: small delta"| RISK
+  SE -->|remove subject| RISK
   RISK --> SCORE
   RISK --> ALERT
 ```
@@ -596,81 +664,154 @@ flowchart TB
 
 Per `session_id`, a `SessionAccumulator` collects raw observations.
 `record_keystroke` discards inter-arrivals outside `(0, 60_000) ms` as noise;
-`record_command` discards inter-command gaps outside `(0, 3_600_000) ms`.
+`record_command` discards inter-command gaps outside `(0, 3_600_000) ms`. The raw
+sample `Vec`s are bounded to a rolling window of the most-recent `SAMPLE_CAP =
+2048` samples, so an attacker-chosen unbounded session cannot exhaust memory.
 `enough_evidence()` gates on `MIN_KEYSTROKES = 12` and `MIN_COMMANDS = 3`.
 
-`features()` returns `Option<FeatureVector>` (None until the gate passes):
+`features()` returns `Option<FeatureVector>` (None until the gate passes). The
+vector carries twelve fields in two tiers — six cheap first-moment **Tier-1
+marginals**, and six **Tier-2/3 joint-structure** features (the latter four of
+which require `MIN_COMMANDS_ROBUST = 16` command gaps and are `NaN` until then):
 
-| Feature | Meaning / intuition |
-|---------|---------------------|
-| `keystroke_cv` | Coefficient of variation (std/mean) of inter-keystroke timing. **The core discriminator**: humans are bursty/irregular (high CV); automation is metronomic (low CV). |
-| `paste_ratio` | Fraction of commands delivered as atomic pastes/bursts. |
-| `mean_inter_command_ms` | Mean think time between commands (humans read output; agents react). |
-| `backspace_ratio` | Fraction of commands composed with corrections (humans err). |
-| `entropy_mean` | Mean Shannon entropy of commands. |
-| `cadence_regularity` | `1 - min(1, CV of inter-command timing)` — clockwork cadence ⇒ agent. |
+| Feature | Tier | Meaning / intuition |
+|---------|------|---------------------|
+| `keystroke_cv` | 1 | Coefficient of variation (std/mean) of inter-keystroke timing. Humans are bursty/irregular (high CV); automation is metronomic (low CV). |
+| `paste_ratio` | 1 | Fraction of commands delivered as atomic pastes/bursts. |
+| `mean_inter_command_ms` | 1 | Mean think time between commands (humans read output; agents react). |
+| `backspace_ratio` | 1 | Fraction of commands composed with corrections (humans err). |
+| `entropy_mean` | 1 | Mean Shannon entropy of commands. |
+| `cadence_regularity` | 1 | `1 - min(1, CV of inter-command timing)` — clockwork cadence ⇒ agent. |
+| `gap_autocorr` | 3 | Lag-1 autocorrelation of think times. i.i.d. injected delays score ≈0 (agent); genuine humans show 0.1–0.6. Traps the cheapest timing evasion. |
+| `think_tail_ratio` | 3 | Heaviness of the think-time tail. Constant/uniform padding ⇒ ratio ≈1 (agent); genuine heavy tails ⇒ ≫1. |
+| `throughput_decay` | 3 | Slope of throughput over the session. Human fatigue ⇒ negative; flat/positive ⇒ agent. |
+| `reaction_floor_hits` | 2 | Fraction of non-paste command gaps below the ~150 ms physiological floor. |
+| `whole_line_paste_ratio` | 2 | Fraction of commands delivered as a single atomic line (agent-shaped). |
+| `keystroke_burst_cv` | 3 | Within-burst keystroke CV; corroborates char-by-char fakes. |
 
 `FeatureVector::to_map()` flattens to a labelled `BTreeMap<String, f64>` for the
-`Detection` event's `features` field (explainability).
+`Detection` event's `features` field (explainability). It **skips non-finite
+values** (`is_finite` guard), so a short session's `NaN` Tier-3 features cannot
+make the `Detection` payload fail to serialize.
 
 ### The model (`model.rs`)
 
 A deliberately **transparent additive model**. Each feature is mapped to an
 "agent-evidence" value in `[0,1]` by a logistic transfer (`sigmoid`) with a
-documented center/slope, then combined as a weighted average. Six terms
-(weights sum to 1.0):
+documented center/slope, then combined as a weighted average. The model has been
+**re-weighted to favor evasion-robust signals**: because the Tier-1 marginals are
+cheap to forge (an evader injecting i.i.d. padding/jitter matches all of them and
+historically slipped to `Human`), they are *demoted* to a combined ≈0.24 and the
+bulk of the weight (≈0.66) sits on the Tier-2/3 joint-structure terms an
+i.i.d.-delay evader cannot reproduce. Eleven terms (weights nominally sum to 1.0
+before NaN-renormalization):
 
 | Term | Weight | Evidence |
 |------|--------|----------|
-| `metronomic-typing` | 0.25 | `sigmoid(8.0 * (0.45 - keystroke_cv))` |
-| `paste-injection` | 0.20 | `paste_ratio.clamp(0,1)` |
-| `instant-reaction` | 0.25 | `sigmoid(0.004 * (1000 - mean_inter_command_ms))` |
-| `errorless-input` | 0.15 | `sigmoid(40.0 * (0.06 - backspace_ratio))` |
-| `dense-commands` | 0.05 | `sigmoid(3.0 * (entropy_mean - 4.2))` |
-| `regular-cadence` | 0.10 | `cadence_regularity.clamp(0,1)` |
+| `metronomic-typing` | 0.06 | `sigmoid(8.0 * (0.45 - keystroke_cv))` |
+| `paste-injection` | 0.04 | `paste_ratio.clamp(0,1)` |
+| `instant-reaction` | 0.10 | `sigmoid(0.004 * (1000 - mean_inter_command_ms))` |
+| `errorless-input` | 0.04 | `sigmoid(40.0 * (0.06 - backspace_ratio))` |
+| `dense-commands` | 0.02 | `sigmoid(3.0 * (entropy_mean - 4.2))` |
+| `regular-cadence` | 0.04 | `cadence_regularity.clamp(0,1)` |
+| `gap-non-autocorrelation` | 0.22 | `sigmoid(6.0 * (0.18 - gap_autocorr))` |
+| `constant-think-time` | 0.12 | `sigmoid(2.2 * (2.0 - think_tail_ratio))` |
+| `no-throughput-decay` | 0.14 | `sigmoid(4.0 * (throughput_decay + 0.05))` |
+| `whole-line-injection` | 0.12 | `whole_line_paste_ratio.clamp(0,1)` |
+| `burst-metronome` | 0.06 | `sigmoid(8.0 * (0.30 - keystroke_burst_cv))` |
 
-`Model::assess` produces `p_agent` (weighted mean), a `Verdict`
-(`>= agent_threshold (0.65)` ⇒ Agent; `<= human_threshold (0.35)` ⇒ Human;
-between ⇒ Uncertain), a `confidence`, and up to three `reasons` (the strongest
-contributors toward the chosen direction). The coefficients are **hand-calibrated
-constants**, not learned; the `Model::assess` interface is designed to be
-swappable for a learned model behind the same shape.
+**NaN handling:** any term whose evidence is `NaN` (a Tier-3 feature on a short
+session) is dropped and the weighted average renormalizes over the surviving
+terms, so a short session leans on the hard-rule inputs and Tier-1 remnants → more
+`Uncertain` by design (false-positive-protecting).
+
+**Hard rules (asymmetric ratchet):** after the weighted average, a small set of
+explainable rules can only ever *raise* `p_agent` (noisy-OR), never lower it:
+(1) sustained sub-floor reaction (`reaction_floor_hits >= 0.25`) co-occurring with
+whole-line delivery (`>= 0.5`) ⇒ `p_agent` floored at 0.92; (2) sustained sub-floor
+non-paste reaction alone (`reaction_floor_hits >= 0.25`, a minimum-evidence gate so
+a single isolated slip does not force a verdict) ⇒ floored at 0.80; (3) the full
+i.i.d.-evader signature (near-zero autocorrelation **and** flat throughput **and** a
+narrow think-time tail simultaneously) ⇒ floored at 0.72. A genuine human with a
+heavy think-time tail never trips rule 3.
+
+`Model::assess` produces `p_agent`, a `Verdict`
+(`>= agent_threshold (0.62)` ⇒ Agent; `<= human_threshold (0.35)` ⇒ Human;
+between ⇒ Uncertain), a `confidence`, and up to three `reasons` (hard-rule reasons
+lead, then the strongest contributors). The thresholds are documented as
+**FPR-budgeted** — a field deployment should re-derive `agent_threshold` from the
+(1−α) quantile of its own human-only `p_agent` distribution. The coefficients are
+**hand-calibrated constants**, not learned; the `Model::assess` interface is
+designed to be swappable for a learned model behind the same shape.
 
 ### Verdict-driven scoring (`plugin-scoring`)
 
-`plugin-scoring` subscribes to `detection`, `process.exec`, `alert`:
+`plugin-scoring` subscribes to `detection`, `process.exec`, `session.end`:
 
 - **`Detection` with `Verdict::Agent`:** `delta = agent_detection_weight (60.0) *
   confidence`; subject is the detection's `subject` (the `session_id`).
+- **`Detection` with `Verdict::Uncertain`** (above `uncertain_min_confidence`,
+  default 0.5): `delta = uncertain_detection_weight (6.0) * confidence` — a small,
+  decaying increment. An isolated `Uncertain` decays away harmlessly, but a session
+  that *persistently* camps the dead band (where `Uncertain` confidence peaks)
+  accumulates faster than it decays and climbs toward an alert. This makes the old
+  "dead-band camping" evasion actionable.
 - **`ProcessExec`:** subject is `"uid:{uid}"`; `delta = process_weight (5.0)`,
   multiplied by 3 for a suspicious executable (`nc, ncat, socat, nmap, tcpdump,
   scp, rsync, curl, wget, base64, openssl, gpg`).
-- **`Alert`:** falls through to the wildcard arm and returns `Ok(())` — **a
-  no-op**. Incoming alerts are consumed but do not affect scoring.
+- **`SessionEnd`:** removes the session's accumulated risk from the map (so
+  session-keyed subjects don't linger).
 
 After each bump, `RiskState.bump` applies `new = (old*decay + delta).clamp(0,
-100)` (`decay = 0.98`), always emits a `Score` event, and emits an `Alert`
-(severity from `severity_for`: `>=90` Critical, `>=75` High, else Medium) when
-`score >= alert_threshold (75.0)`.
+100)` (`decay = 0.98`, range-validated in `init`), emits a `Score` event, and emits
+an `Alert` (severity from `severity_for`: `>=90` Critical, `>=75` High, else Medium)
+when `score >= alert_threshold (75.0)`. A subject whose score decays below a
+negligible floor is evicted, so the map cannot grow without bound across many
+short-lived subjects.
 
-Two known quirks visible in the code: the `Score` event's `features` map is
-emitted **empty** (`Default::default()`), discarding the per-signal breakdown;
-and the `Detection` subject (`session_id`) and `ProcessExec` subject
-(`"uid:{uid}"`) live in **disjoint namespaces**, so a detected agent session and
-that user's suspicious process executions accumulate into separate scores rather
-than compounding. Both are in the ADR.
+`Score.features` now carries the **risk decomposition** (`risk_score`, `delta`,
+`decay`, plus `source_confidence` / `verdict_agentness` for detection-sourced
+bumps), so the dashboard can explain a score. One quirk remains, noted in the ADR:
+the `Detection` subject (`session_id`) and `ProcessExec` subject (`"uid:{uid}"`)
+live in **disjoint namespaces**, so a detected agent session and that user's
+suspicious process executions accumulate into separate scores rather than
+compounding.
 
-### The pipeline is currently inert end-to-end
+### End-to-end: the pipeline is live and tested
 
-`plugin-agent-detect` subscribes to `input.keystroke` and `command.observed`,
-but **no plugin in the workspace emits those kinds.** `plugin-session` emits a
+`plugin-tty` emits `Keystroke` / `CommandObserved` (its content-free `Analyzer`,
+driven either by a real PTY in `mode = "shell"` or a timestamped pipe in
+`mode = "pipe"`), which feed `plugin-agent-detect` → `Detection` →
+`plugin-scoring` → `Score` / `Alert`. The integration test
+`crates/aegis-integration-tests/tests/pipeline.rs`
+(`agent_session_yields_detection_score_and_alert`) drives synthetic agent
+telemetry through the **real** `aegis-core` bus (the same processors the server
+loads) and asserts the full Keystroke/CommandObserved → Detection(Agent) → Score →
+Alert flow, including host-asserted `source` provenance and the populated
+`Score.features`. A companion test asserts a human session is never classified
+`Agent`. The only collector that did *not* exist when this section was first
+written — a tty/pty collector — is now `plugin-tty`.
+
+> Caveat on fidelity (preserved from the threat model): `plugin-tty` reconstructs
+> behavioral statistics from a **PTY** (shell mode) or a pipe (CI). This is
+> userspace interception, not a kernel-boundary (eBPF/HID) source, so the timing
+> it reports is still a self-reported scalar an adversary co-resident in the same
+> session could in principle shape. The model's re-weighting toward joint-structure
+> features raises the cost of that shaping, but moving to un-forgeable signals
+> remains future work (see THREAT_MODEL §5.1).
+
+### Historical note: the collector gap (now closed)
+
+`plugin-agent-detect` subscribes to `input.keystroke` and `command.observed`.
+Earlier in development **no plugin emitted those kinds** — `plugin-session` emits a
 single `SessionStart` at startup (derived from `$USER`, `$SSH_TTY`/`$TTY`,
-`$SSH_CONNECTION`) and exports `command_stats()` / `shannon_entropy()` helpers
-for a future capture layer — but it does no live tty/pty interception. Without
-`Keystroke`/`CommandObserved` events, `enough_evidence()` never passes, so no
-`Detection` is ever produced and `plugin-scoring`'s verdict-driven path never
-fires. Closing this gap (a tty/pty collector) is the single highest-leverage
-change; it is the first item in the ADR roadmap.
+`$SSH_CONNECTION`) and exports `command_stats()` / `shannon_entropy()` helpers, but
+does no live interception. That gap — once the single highest-leverage item on the
+roadmap — is now **closed** by `plugin-tty`, which emits `Keystroke` /
+`CommandObserved` from a PTY or pipe; `enough_evidence()` passes and the full
+verdict-driven path fires (see the integration test above). `plugin-session`
+remains as a lightweight session-lifecycle collector and a library of content-free
+summary helpers.
 
 ---
 
@@ -680,24 +821,35 @@ change; it is the first item in the ADR roadmap.
 binary**: no external database and no runtime asset directory. The architecture
 chooses pure-Rust, musl-friendly dependencies throughout to make that possible.
 
-### Embedded store (planned, deps present)
+### Embedded store (implemented)
 
-`redb` (a pure-Rust embedded ACID key-value store, no C dependency) is declared
-as a workspace dependency for durable persistence. It is **not yet referenced**
-by any source file. The intended design is a `plugin-store` Sink subscribing to
-the bus and writing events keyed by `(agent_id, ts_ns, event_id)`, which would:
-give the operator a queryable history behind each alert; let the server-side risk
-scores survive restart (today `RiskState.scores` is an in-memory `HashMap` that
-resets to zero on restart); and give `ServerCommand::Rescore` a history to replay.
+`redb` (a pure-Rust embedded ACID key-value store, no C dependency) is the
+server's durable persistence layer, **implemented** in
+`crates/aegis-server/src/store.rs` as a single file `{data_dir}/aegis.redb`. It
+materializes tables for `events` (keyed by `composite_key(ts_ns, id)`),
+`events_by_agent` (a secondary index for the operator pagination API),
+`detections`, `scores`, `alerts`, `agents`, and `enroll_tokens`. The in-host
+`StoreSink` (`sink.rs`, `Subscriptions::All`) persists derived telemetry
+(detections/scores/alerts/heartbeats), and the ingest path writes raw agent
+telemetry. A background compaction task prunes old `events`/`alerts` past a
+retention window and **prunes the `events_by_agent` index in the same write
+transaction**, so the pagination API does not accumulate stale pointers.
 
-### Embedded assets (planned, deps present)
+> Note: `plugin-scoring`'s in-process `RiskState` is still an in-memory `HashMap`
+> (it evicts decayed/ended subjects but resets on restart). Server-side *history*
+> now survives restart via the store; replaying it into the live risk scores
+> (`ServerCommand::Rescore` over stored history) remains future work.
 
-`axum`, `tower`, `rust-embed`, and `mime_guess` are declared for the operator
-dashboard. `rust-embed` compiles HTML/JS/CSS **into** the binary, satisfying the
-"no runtime asset directory" constraint. The dashboard is intended as a
-`plugin-dashboard` Sink (subscribing to `Subscriptions::All`, serving the `--http`
-address). None of these are referenced by source yet; `aegisd` parses `--listen`
-and `--http` but binds neither socket.
+### Embedded assets (implemented)
+
+`axum`, `tower`, `rust-embed`, and `mime_guess` back the operator HTTP
+API/dashboard, **implemented** in `crates/aegis-server/src/api.rs` (the JSON
+`/api/v1/...` routes) and `dashboard.rs` (the SPA). `rust_embed::RustEmbed`
+compiles the dashboard bundle **into** the binary, satisfying the "no runtime
+asset directory" constraint; the dashboard is wired as the axum `Router` fallback
+with an SPA-aware handler. `aegisd` binds **both** sockets: `--listen` for the TLS
+ingest listener (`ingest::serve`) and `--http` for the API/dashboard
+(`api::serve`).
 
 ### Static musl linking
 
@@ -741,51 +893,71 @@ process hiding, and always retains an **authenticated root/administrator
 uninstall** path. (See `docs/THREAT_MODEL.md`.)
 
 Self-protection is expressed as a plugin (`plugin-tamper`, `PluginKind::Control`)
-plus an installer spec — "the agent defends itself" is just another capability,
-not core behavior. Three layers:
+plus a privileged installer — "the agent defends itself" is just another
+capability, not core behavior. All layers below are **implemented**:
 
-1. **Posture detection** (implemented). `posture()` reports `is_root` (read from
-   `/proc/self/status`, avoiding a libc dependency) and `systemd_present` (PID 1
-   `comm == "systemd"`).
-2. **Tamper-watch loop** (implemented). A task spawned in `init()` checks every
-   `check_interval_s` (floored at 1s) whether each `protected_paths` entry still
-   exists; a missing path emits a `Severity::Critical` `Alert`. *Limitation:* it
-   checks `path.exists()` only — it detects deletion, not in-place content
-   modification, attribute change, or inode replacement.
-3. **Hardened install** (spec implemented, privileged steps **not** implemented).
-   `install.rs` renders two systemd units via `render_service_unit` /
-   `render_guardian_unit` from an `InstallSpec` (defaults: service `aegis-agent`,
-   guardian `aegis-guardian`, install path `/usr/local/sbin/aegis-agent`, run as
-   `root`). The service uses `Restart=always`, `RestartSec=1`,
+1. **Posture detection.** `posture()` reports `is_root` (via `geteuid()` — the
+   *effective* uid, which is what the privileged operations actually require),
+   `systemd_present` (PID 1 `comm == "systemd"`), and `pid_ns_matches_init`
+   (compares `/proc/self/ns/pid` to `/proc/1/ns/pid` to detect a
+   sandboxed/containerized mis-deployment). At init the plugin emits a `Critical`
+   alert enumerating any weakness (not root / no systemd / wrong PID-ns / protected
+   files not immutable) rather than failing closed.
+2. **Tamper-watch loop.** A task spawned in `init()` runs every `check_interval_s`
+   (floored at 1s) and now does **content integrity**, not just existence:
+   (a) it verifies each protected file against a SHA-256 **baseline manifest**
+   (`manifest::verify`, which uses a `metadata` size pre-filter then a streaming
+   hash, so a hostile oversized/same-size replacement is caught without slurping
+   the file) — catching in-place replacement; (b) it watches the **immutable bit**
+   on each protected path (clearing it required root and is itself auditable
+   tampering); (c) it falls back to an existence check for any unmanifested path;
+   and (d) it emits a `Heartbeat` each tick so the server can distinguish a
+   kill/restart from a network drop. Any drift emits a `Severity::Critical` `Alert`.
+   A SIGTERM/SIGINT **tripwire** also emits a `Critical` alert before the process
+   exits, so an externally induced stop is reported even when a guardian revives it.
+3. **Hardened install/uninstall/guard.** `install.rs` renders two systemd units
+   (`render_service_unit` / `render_guardian_unit` from an `InstallSpec`: service
+   `aegis-agent`, guardian `aegis-guardian`, install path
+   `/usr/local/sbin/aegis-agent`, `User=root`) **and performs the privileged steps**:
+   it copies the binary and writes the units/manifest root-owned through
+   `O_NOFOLLOW` fds with `fchown`, runs `systemctl daemon-reload` + `enable --now`,
+   and sets `FS_IMMUTABLE_FL` (via ioctl, `immutable.rs`) on the binary and units.
+   `uninstall()` clears the immutable bit, disables, and removes — the authenticated
+   root uninstall path. `guard()` is a real liveness watchdog loop (the `aegis-agent
+   guard` subcommand). The service uses `Restart=always`, `RestartSec=1`,
    `OOMScoreAdjust=-900`, `KillMode=process`, and `Requires` the guardian; the
    guardian `BindsTo` the service, so killing one triggers recovery of both.
 
 ```mermaid
 flowchart TB
-  subgraph Implemented
-    POS["posture(): is_root, systemd_present"]
-    WATCH["tamper-watch loop\npath.exists() -> Critical Alert"]
-    SPEC["render_service_unit / render_guardian_unit"]
+  subgraph Posture["Posture + watch (plugin-tamper)"]
+    POS["posture(): is_root (geteuid), systemd_present, pid_ns_matches_init"]
+    WATCH["tamper-watch loop\nSHA-256 manifest verify + immutable-bit watch\n+ existence fallback -> Critical Alert; Heartbeat each tick"]
+    TRIP["SIGTERM/SIGINT tripwire -> Critical Alert"]
   end
-  subgraph Designed_not_implemented["Designed, not implemented"]
-    COPY["copy binary to root-owned install_path"]
-    IMM["chattr +i (FS_IMMUTABLE_FL) on binary + units"]
+  subgraph Install["Privileged installer (install.rs)"]
+    COPY["copy binary to root-owned install_path (O_NOFOLLOW + fchown)"]
+    IMM["chattr +i (FS_IMMUTABLE_FL via ioctl) on binary + units"]
     ENABLE["systemctl daemon-reload + enable --now"]
     GUARD["guard subcommand: real liveness watchdog"]
-    UNINST["authenticated root uninstall:\nclear +i, disable, remove"]
+    UNINST["authenticated root uninstall: clear +i, disable, remove"]
   end
-  SPEC --> COPY --> IMM --> ENABLE
-  ENABLE --> GUARD
+  COPY --> IMM --> ENABLE --> GUARD
 ```
 
-The decisive missing mechanism is the **immutable attribute**. With
-`FS_IMMUTABLE_FL` set on root-owned files, an unprivileged user cannot modify or
-delete the binary or units (clearing the flag needs `CAP_LINUX_IMMUTABLE` ≈
-root); root can always `chattr -i` and uninstall — preserving the authenticated
-admin uninstall guarantee. Today `aegis-agent install` only **prints** the
-rendered units, `uninstall` prints a deferral line, and `guard` logs and exits.
-Implementing these privileged steps is required to actually meet the
-"unprivileged user cannot uninstall" goal and is high-priority in the ADR.
+The decisive mechanism is the **immutable attribute**. With `FS_IMMUTABLE_FL` set
+on root-owned files, an unprivileged user cannot modify or delete the binary or
+units (clearing the flag needs `CAP_LINUX_IMMUTABLE` ≈ root); root can always
+`chattr -i` and uninstall — preserving the authenticated admin uninstall guarantee.
+The deployed `run` path injects this hardened layout into `plugin-tamper`'s config
+when running as root, so the immutable-bit watch and manifest check are live in the
+service.
+
+> By design, the tamper-watch loop is **alert-only**: it reports drift but never
+> re-arms the immutable bit or rewrites a drifted file. Clearing the bit or
+> replacing a protected file already requires root, and auto-re-arming would race
+> the legitimate root uninstall (which clears the bit on purpose). See
+> `docs/THREAT_MODEL.md` for the rationale.
 
 ---
 
@@ -890,8 +1062,10 @@ will route the kinds you subscribed to.
   novel data use `EventPayload::Custom(serde_json::Value)` rather than changing
   the SDK.
 - **Dynamic plugins:** to ship as a separate `.so`, build a `cdylib` exporting
-  `aegis_plugin_entry` returning a `*mut DynPluginRegistration`, and add its path
-  to `HostConfig::dynamic_plugins`.
+  both `aegis_plugin_entry` (returns a `*mut DynPluginRegistration`) and the paired
+  `aegis_plugin_free_registration` free function (so the registration is released by
+  its owning allocator, not the host's), and add its path to
+  `HostConfig::dynamic_plugins`. See `crates/example-plugin` for a reference cdylib.
 
 ---
 
@@ -901,25 +1075,31 @@ will route the kinds you subscribed to.
 |------|--------|
 | Event model (`aegis-sdk`) | Implemented, tested |
 | Plugin trait + static (`inventory`) registration | Implemented, tested |
-| Dynamic (cdylib) loader | Implemented (no integrity check beyond ABI version) |
-| Kernel: discovery, dispatch, lifecycle, back-pressure | Implemented, tested |
-| Wire protocol (`aegis-proto`) | Implemented, tested |
+| Dynamic (cdylib) loader | Implemented, tested (allocator-correct free, `catch_unwind`, enable-before-load, name match; **no signature/hash integrity gate** — see ADR #15) |
+| Kernel: discovery, dispatch, lifecycle, back-pressure (+ drop metrics, critical-kind back-pressure, per-plugin source/agent_id stamping) | Implemented, tested |
+| Wire protocol (`aegis-proto`) + TLS-1.3 config + SHA-256 pinning + Ed25519 auth | Implemented, tested |
 | `plugin-process`, `plugin-session`, `plugin-tamper` (collectors/control) | Implemented, tested |
+| `plugin-tty` (keystroke/command capture, PTY shell + pipe modes) | Implemented, tested (real PTY; defaults to `off`) |
 | `plugin-agent-detect`, `plugin-scoring` (processors) | Implemented, tested |
-| Keystroke / command capture (tty/pty) | **Not implemented** — detection pipeline is inert without it |
-| Agent forwarder (TLS, batching) | **Not implemented** (`aegis-proto` dep present, unused; `--server` ignored) |
-| Server ingest listener (TLS/8443) | **Not implemented** (`--listen` parsed, not bound) |
-| Operator dashboard (HTTP/8080) | **Not implemented** (`--http` parsed, not bound; axum/rust-embed deps present, unused) |
-| Enrollment + Ed25519 identity lifecycle | **Not implemented** (protocol present; agent_id is the literal `agent-local`) |
-| Embedded store (redb) | **Not implemented** (dep present, unused; server state is in-memory) |
-| Privileged installer (copy, `chattr +i`, systemctl) + guardian watchdog | **Not implemented** (unit-text rendering only) |
+| `plugin-transport` (mTLS forwarder, ring + disk spill, Ed25519 session auth) | Implemented, tested |
+| End-to-end Detection → Score → Alert over the real bus | Implemented, tested (`aegis-integration-tests/tests/pipeline.rs`) |
+| Server ingest listener (TLS-1.3, `--listen`) | Implemented, tested (idle/first-frame timeouts, ts_ns clamp, FIFO + global dedup) |
+| Operator HTTP API/dashboard (`--http`, axum + rust-embed) | Implemented (both sockets bound) |
+| Enrollment + Ed25519 identity lifecycle | Implemented, tested (one-time token burn, challenge-response) |
+| Embedded store (redb) | Implemented, tested (`{data_dir}/aegis.redb`; compaction prunes the secondary index in-txn) |
+| Privileged installer (copy, `chattr +i`, systemctl) + guardian watchdog + uninstall | Implemented (`O_NOFOLLOW` + `fchown`; SIGTERM tripwire) |
+| Content-integrity tamper-watch (SHA-256 manifest + immutable-bit) | Implemented, tested |
 | Static musl build (CI `ldd` static-link assertion) | Implemented (`static-server` job in CI) |
-| Static musl build config (`.cargo/config.toml`, `BUILD.md`) | **Missing** |
+| Dynamic-plugin `.so` signature/hash integrity gate | **Not implemented** (ADR #15 — the one remaining high-leverage gap) |
+| Per-deployment `command_hash` salt | **Partial** — still defaults to `"aegis-default-salt"` (ADR #13) |
+| Static ABI-version mismatch on static plugins | **Warn-and-skip** (lenient; ADR #20 proposes a hard error) |
+| Static musl build config (`.cargo/config.toml`, `BUILD.md`) | **Verify** (CI relies on `musl-tools`; ADR #26) |
 
-The "not implemented" rows are precisely the agent↔server data path, the
-detection pipeline's first link, and the tamper-resistance enforcement — i.e.
-the gap between the implemented kernel/plugins and the running platform the
-overview describes.
+The agent↔server data path, the detection pipeline's first link (tty/pty capture),
+the persistence layer, the dashboard, enrollment, and the tamper-resistance
+enforcement are now all implemented and exercised. The remaining open rows are a
+small set of hardening gaps (most importantly the dynamic-loader integrity gate)
+tracked in the ADR below.
 
 ---
 
@@ -928,36 +1108,38 @@ overview describes.
 Distilled from the cross-discipline round-table review. Priority reflects impact
 on making the platform function as designed. "ADR" entries record both
 *standing* design decisions (already in the code) and *recommended* decisions
-(the roadmap).
+(the roadmap). The **Status** column records what the code now does: most of the
+original roadmap has since been **implemented** — the remaining open items are
+called out as Open/Partial.
 
-| # | Decision | Rationale | Priority |
-|---|----------|-----------|----------|
-| 1 | **Everything is an Event; everything is a Plugin** (standing). One envelope on one bus; the kernel implements no features; plugins depend only on `aegis-sdk`. | Keeps the core feature-free and replaceable; any capability is added without touching the kernel. Enforced by the SDK←core←binary layering. | standing |
-| 2 | **Privacy by design in the event schema** (standing). `Keystroke` carries timing/shape only; `CommandObserved` carries structural stats + a salted hash. | The structural constraint makes content capture impossible by construction, not just by policy. | standing |
-| 3 | **Two registration paths, one constructor** (standing). Static `inventory` for built-ins; C-ABI cdylib for third parties; both yield `fn() -> Box<dyn Plugin>`. | Built-ins need zero boilerplate (link = register); the platform still supports out-of-tree plugins. | standing |
-| 4 | **Drop-on-full back-pressure** (standing). `try_send` at ingress and per-plugin fan-out; per-plugin queues isolate slow consumers. | Bounds memory and prevents head-of-line blocking. Accepts silent loss under saturation. | standing |
-| 5 | **Transparent additive detection model** (standing). Six weighted sigmoid terms, hand-calibrated, with top-3 `reasons`. | Explainability is essential for an insider-threat verdict; the `Model::assess` interface stays swappable for a learned model. | standing |
-| 6 | **Self-contained static server** (standing). Pure-Rust musl-friendly deps (`rustls`+`ring`, `redb`, `rust-embed`); `[profile.dist]` fat-LTO. | Meets the "single binary, no external DB, no asset dir" constraint. | standing |
-| 7 | **Tamper resistance via supported OS mechanisms only** (standing). Root-owned files + immutable attribute + systemd watchdog pair; authenticated root uninstall always exists. | Resists the unprivileged user without becoming a rootkit; preserves admin control and auditability. | standing |
-| 8 | **Implement a tty/pty capture plugin** to emit `Keystroke` / `CommandObserved`. | The detection pipeline is structurally complete but receives zero input events, so it never produces a verdict. This is the single highest-leverage change. | high |
-| 9 | **Implement the agent forwarder + server ingest** as plugins using `aegis-proto` over `tokio-rustls`; inject via `RunningHost::emitter()`. | Without them the client/server platform is disconnected: the server's processors never receive agent telemetry. | high |
-| 10 | **Implement the privileged installer** (binary copy, `FS_IMMUTABLE_FL` via ioctl, `systemctl enable`) and a real `guard` watchdog. | Required to actually achieve "an unprivileged user cannot uninstall, but root can." Today install only prints unit text. | high |
-| 11 | **Expose a dropped-event counter / saturation metric** and surface it (heartbeat label or dashboard). | Silent telemetry loss is indistinguishable from absence of behavior and can be induced to suppress a signature; operators need observability. | high |
-| 12 | **Implement enrollment + per-agent Ed25519 identity** (`EnrollRequest`/`EnrollResponse`, key gen at install, token store). | Gives each endpoint a cryptographic identity, enables mTLS session auth and the `Isolate` control path; today `agent_id` is the literal `agent-local`. | high |
-| 13 | **Replace the default `hash_salt`** (`"aegis-default-salt"`) with a per-deployment salt (generated at install / derived at enrollment); warn if the default is in use. | A shared default makes `command_hash` correlatable across all default deployments, defeating the privacy isolation property. | high |
-| 14 | **Add a persistent event store (`plugin-store`, redb)**. | Server risk scores and history are in-memory and reset on restart; an alert has no replayable evidence and `Rescore` has no history to read. | high/medium |
-| 15 | **Add an integrity gate to `load_dynamic`** (content hash allowlist and/or Ed25519 signature) before relying on third-party `.so`s. | Dynamic plugins run in-process with full privileges; the ABI-version check authenticates nothing. A planted `.so` is a privilege-escalation vector for the very user `plugin-tamper` resists. | medium |
-| 16 | **Implement the operator dashboard (`plugin-dashboard`, axum + rust-embed)** and `aegisctl` control-plane subcommands. | Alerts currently have no operator-facing delivery and `ServerCommand::Isolate` is unreachable; the dashboard is where the trust boundary is enforced. | medium |
-| 17 | **Add client-side batching + WAL in the forwarder** (size/age flush, redb-backed, idempotent on `batch_id`). | Per-event TLS writes are wasteful; without a WAL any restart before `BatchAck` permanently loses audit telemetry. Keep frames well under `MAX_FRAME_BYTES`. | medium |
-| 18 | **Populate `Score.features`** with the per-signal contribution and **correlate `ProcessExec` risk with the session** instead of the disjoint `uid:{uid}` subject. | Score events are currently uninformative for explainability, and agent-detected sessions never compound with that user's suspicious processes. | medium |
-| 19 | **Extend tamper-watch to content integrity** (hash baseline at init; compare per tick; optionally inode/mtime pre-filter). | `path.exists()` detects deletion but not in-place binary replacement — the exact way to swap in an agent that suppresses its own detections. | medium |
-| 20 | **Make the static ABI-version mismatch a hard error** (match the strict dynamic path) and add an actionable SDK-version message. | Today a compiled-in `PLUGIN_API_VERSION` mismatch silently warn-and-skips, producing an agent that starts but is missing capabilities. | medium |
-| 21 | **Add a model calibration/evaluation harness** and embed a coefficient fingerprint in the `Detection.model` field. | Coefficients are hand-tuned with no empirical validation and are fully visible to an adversary; a harness grounds them and guards against regressions. | medium |
-| 22 | **Add a plugin health/readiness signal** (default-Ok trait method) and consider explicit init ordering by `PluginKind`. | Lets a transport plugin report a bind failure (init cannot fail the host after returning) and removes reliance on non-deterministic `inventory` link order. | medium/low |
-| 23 | **Emit and consume `Heartbeat`** for agent liveness; alert on missed heartbeats. | `Heartbeat` is defined but never produced/consumed; the server cannot distinguish a graceful disconnect from a killed/tampered agent. | low |
-| 24 | **Move `plugin-process` from `/proc` polling toward inotify/eBPF** and replace the clear-on-overflow `seen` set with TTL eviction. | Short-lived agent processes can complete within the poll window and be missed; clearing the 65,536-cap set re-emits every running process as new. | low |
-| 25 | **Defer WASM plugin sandboxing.** Keep static/dynamic in-process plugins as trusted code; mitigate dynamic risk with #15. | Async/tokio plugins have no practical WASM story today and the sensitive timing data crosses the host boundary regardless; the isolation benefit is marginal versus the cost. | low |
-| 26 | **Add `.cargo/config.toml` (musl linker) and write `BUILD.md`.** | CI already builds `aegisd` for musl and asserts static linking via `ldd` (the `static-server` job), but there is no committed toolchain/linker config to reproduce that locally, and the `BUILD.md` referenced by `aegisd`'s doc comment is still missing. | low |
+| # | Decision | Rationale | Priority | Status |
+|---|----------|-----------|----------|--------|
+| 1 | **Everything is an Event; everything is a Plugin** (standing). One envelope on one bus; the kernel implements no features; plugins depend only on `aegis-sdk`. | Keeps the core feature-free and replaceable; any capability is added without touching the kernel. Enforced by the SDK←core←binary layering. | standing | In code |
+| 2 | **Privacy by design in the event schema** (standing). `Keystroke` carries timing/shape only; `CommandObserved` carries structural stats + a salted hash. | The structural constraint makes content capture impossible by construction, not just by policy. | standing | In code |
+| 3 | **Two registration paths, one constructor** (standing). Static `inventory` for built-ins; C-ABI cdylib for third parties; both yield `fn() -> Box<dyn Plugin>`. | Built-ins need zero boilerplate (link = register); the platform still supports out-of-tree plugins. | standing | In code |
+| 4 | **Criticality-aware back-pressure** (standing). Low-value telemetry is `try_send`-dropped (and **counted** via `BusMetrics`); `alert`/`detection`/`score` take a non-droppable `send().await` path; per-plugin queues isolate slow consumers. | Bounds memory and prevents head-of-line blocking, while guaranteeing the detection outputs are never flood-evicted; loss is observable. | standing | In code |
+| 5 | **Transparent additive detection model** (standing). Eleven weighted sigmoid terms (Tier-1 marginals demoted ≈0.24, Tier-2/3 joint-structure ≈0.66) + three asymmetric hard rules, hand-calibrated, FPR-budgeted threshold 0.62, with top-3 `reasons`. | Explainability is essential for an insider-threat verdict; the re-weighting and hard rules raise the cost of cheap i.i.d.-delay evasion; the `Model::assess` interface stays swappable for a learned model. | standing | In code |
+| 6 | **Self-contained static server** (standing). Pure-Rust musl-friendly deps (`rustls`+`ring`, `redb`, `rust-embed`); `[profile.dist]` fat-LTO. | Meets the "single binary, no external DB, no asset dir" constraint. | standing | In code |
+| 7 | **Tamper resistance via supported OS mechanisms only** (standing). Root-owned files + immutable attribute (applied at install) + systemd watchdog pair + content-integrity watch; authenticated root uninstall always exists. | Resists the unprivileged user without becoming a rootkit; preserves admin control and auditability. | standing | In code |
+| 8 | **Implement a tty/pty capture plugin** to emit `Keystroke` / `CommandObserved`. | Was the single highest-leverage change: the detection pipeline was structurally complete but received zero input events. | high | **Done** (`plugin-tty`; real PTY shell mode + pipe mode) |
+| 9 | **Implement the agent forwarder + server ingest** using `aegis-proto` over `tokio-rustls`; inject via `RunningHost::emitter()`. | Without them the client/server platform is disconnected. | high | **Done** (`plugin-transport` + `ingest::serve`) |
+| 10 | **Implement the privileged installer** (binary copy, `FS_IMMUTABLE_FL` via ioctl, `systemctl enable`) and a real `guard` watchdog. | Required to actually achieve "an unprivileged user cannot uninstall, but root can." | high | **Done** (`install.rs` install/uninstall/guard; `O_NOFOLLOW`+`fchown`) |
+| 11 | **Expose a dropped-event counter / saturation metric.** | Silent telemetry loss can be induced to suppress a signature; operators need observability. | high | **Done** (`BusMetrics`, `RunningHost::bus_metrics()`) |
+| 12 | **Implement enrollment + per-agent Ed25519 identity.** | Gives each endpoint a cryptographic identity, enables mTLS session auth and the `Isolate` path. | high | **Done** (`enroll::enroll`, challenge-response auth) |
+| 13 | **Replace the default `hash_salt`** with a per-deployment salt; warn if the default is in use. | A shared default makes `command_hash` correlatable across all default deployments. | high | **Open** — still defaults to `"aegis-default-salt"` in `plugin-tty`/`plugin-session` |
+| 14 | **Add a persistent event store (redb).** | Server history was in-memory and reset on restart. | high/medium | **Done** (`store.rs`, `StoreSink`). Replaying history into live scores (`Rescore`) is still open. |
+| 15 | **Add an integrity gate to `load_dynamic`** (content hash allowlist and/or Ed25519 signature). | Dynamic plugins run in-process with full privileges; the ABI-version check authenticates nothing. | medium | **Open** — the single most significant remaining gap (loader has only a doc comment; enable-before-load, `catch_unwind`, allocator-correct free, and name-match are done) |
+| 16 | **Implement the operator dashboard (axum + rust-embed)** and control-plane surfacing. | The dashboard is where the trust boundary is enforced and where alerts are delivered. | medium | **Done** (`api.rs` + `dashboard.rs`). `aegisctl` control-plane subcommands still thin. |
+| 17 | **Add client-side batching + WAL in the forwarder** (size/age flush, idempotent on `batch_id`). | Per-event TLS writes are wasteful; a WAL prevents loss on restart before `BatchAck`. | medium | **Done** (ring buffer + disk spill with enforced cap in `plugin-transport`) |
+| 18 | **Populate `Score.features`** and **correlate `ProcessExec` risk with the session** instead of the disjoint `uid:{uid}` subject. | Score events were uninformative; agent-detected sessions never compound with that user's processes. | medium | **Partial** — `Score.features` now carries the risk decomposition; the `Detection`/`ProcessExec` subject namespaces are still disjoint |
+| 19 | **Extend tamper-watch to content integrity** (hash baseline; per-tick compare; size pre-filter). | Existence checks miss in-place binary replacement. | medium | **Done** (`manifest.rs`: size pre-filter + streaming hash; immutable-bit watch) |
+| 20 | **Make the static ABI-version mismatch a hard error** (match the strict dynamic path). | A compiled-in `PLUGIN_API_VERSION` mismatch silently warn-and-skips. | medium | **Open** — static path still warn-and-skips (`host.rs`); dynamic path is strict |
+| 21 | **Add a model calibration/evaluation harness** and embed a coefficient fingerprint in `Detection.model`. | Coefficients are hand-tuned and fully visible to an adversary. | medium | **Partial** — a synthetic-evaluation harness (`plugin_agent_detect::synth`) exists and drives the e2e test; a coefficient fingerprint in `Detection.model` is still open |
+| 22 | **Add a plugin health/readiness signal** and consider explicit init ordering by `PluginKind`. | Lets a transport plugin report a bind failure; removes reliance on `inventory` link order. | medium/low | **Open** |
+| 23 | **Emit and consume `Heartbeat`** for agent liveness; alert on missed heartbeats. | The server must distinguish a graceful disconnect from a killed/tampered agent. | low | **Partial** — `plugin-tamper` emits `Heartbeat` each tick; server-side missed-heartbeat alerting still open |
+| 24 | **Move `plugin-process` from `/proc` polling toward inotify/eBPF** and TTL-evict the `seen` set. | Short-lived agent processes can be missed; clearing the cap set re-emits every process. | low | **Open** |
+| 25 | **Defer WASM plugin sandboxing.** Keep in-process plugins trusted; mitigate dynamic risk with #15. | The isolation benefit is marginal versus the cost; sensitive timing crosses the host boundary regardless. | low | **Deferred** (by decision) |
+| 26 | **Add `.cargo/config.toml` (musl linker) and write `BUILD.md`.** | CI builds `aegisd` for musl via `musl-tools` but there is no committed linker config to reproduce locally. | low | **Verify/Open** |
 
 ---
 
