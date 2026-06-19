@@ -31,27 +31,127 @@ pub struct EvalReport {
     pub uncertain_rate: f64,
 }
 
-/// Linear interpolation of agent parameters toward human parameters by `t`.
-/// `t = 0` is a naive agent; `t = 1` is a perfect behavioural mimic.
-fn evade(t: f64) -> ProfileParams {
-    let h = ProfileParams::human();
-    let a = ProfileParams::agent();
+/// Lerp **all** of `from`'s parameters toward `to` by `t` (the joint mimic).
+/// `lerp_params(agent, human, t)` is the canonical full-tactic evader; the
+/// per-tactic [`evade_tactic`] reuses the same per-field arithmetic on a single
+/// family so the joint and ablation paths cannot drift apart.
+fn lerp_params(from: &ProfileParams, to: &ProfileParams, t: f64) -> ProfileParams {
     let lerp = |x: f64, y: f64| x + (y - x) * t;
     let lerp2 = |x: (f64, f64), y: (f64, f64)| (lerp(x.0, y.0), lerp(x.1, y.1));
     ProfileParams {
-        keystroke_lognormal: lerp2(a.keystroke_lognormal, h.keystroke_lognormal),
-        think_lognormal: lerp2(a.think_lognormal, h.think_lognormal),
-        backspace_p: lerp(a.backspace_p, h.backspace_p),
-        paste_p: lerp(a.paste_p, h.paste_p),
-        entropy: lerp2(a.entropy, h.entropy),
-        commands: lerp2(a.commands, h.commands),
-        keystrokes_per_cmd: lerp2(a.keystrokes_per_cmd, h.keystrokes_per_cmd),
-        // A sophisticated mimic must also reproduce the human's *temporal
-        // structure* (serial correlation + fatigue), not just the marginals;
-        // the evader acquires it only as it spends budget toward `t = 1`.
-        think_autocorr: lerp(a.think_autocorr, h.think_autocorr),
-        think_fatigue: lerp(a.think_fatigue, h.think_fatigue),
+        keystroke_lognormal: lerp2(from.keystroke_lognormal, to.keystroke_lognormal),
+        think_lognormal: lerp2(from.think_lognormal, to.think_lognormal),
+        backspace_p: lerp(from.backspace_p, to.backspace_p),
+        paste_p: lerp(from.paste_p, to.paste_p),
+        entropy: lerp2(from.entropy, to.entropy),
+        commands: lerp2(from.commands, to.commands),
+        keystrokes_per_cmd: lerp2(from.keystrokes_per_cmd, to.keystrokes_per_cmd),
+        think_autocorr: lerp(from.think_autocorr, to.think_autocorr),
+        think_fatigue: lerp(from.think_fatigue, to.think_fatigue),
     }
+}
+
+/// Linear interpolation of agent parameters toward human parameters by `t`.
+/// `t = 0` is a naive agent; `t = 1` is a perfect behavioural mimic that has
+/// acquired the human's *temporal structure* (serial correlation + fatigue),
+/// not just the marginals.
+fn evade(t: f64) -> ProfileParams {
+    lerp_params(&ProfileParams::agent(), &ProfileParams::human(), t)
+}
+
+/// A single, named evasion **tactic family** the adversary can buy in isolation.
+///
+/// Each variant maps to a disjoint subset of [`ProfileParams`] fields and, in
+/// turn, to a known set of [`Model`] terms / hard rules (see [`evade_tactic`]).
+/// Moving one family while holding the others at their naive-agent defaults is
+/// the per-tactic *ablation* that ranks tactics by evasion efficiency — the
+/// empirical test of the design's Tier-1-cheap / Tier-3-costly hypothesis.
+///
+/// The five tactics enumerate exactly the families that map onto the
+/// demoted-Tier-1 vs promoted-Tier-2/3 split the model claims. The remaining
+/// `ProfileParams` fields (`entropy`, `commands`, `keystrokes_per_cmd`) back
+/// only weak corroborators (`dense-commands` 0.02) or session volume, so they
+/// are deliberately *not* exposed as named tactics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tactic {
+    /// Keystroke-timing realism: lerp `keystroke_lognormal` (μ, σ).
+    /// Moves `metronomic-typing` (0.06) and `burst-metronome` (0.06).
+    KeystrokeTiming,
+    /// Reaction-time realism: lerp `think_lognormal` (μ, σ).
+    /// Moves `instant-reaction` (0.10), `constant-think-time` (0.12), and lifts
+    /// gaps off the physiological reaction floor (hard rules).
+    ThinkTime,
+    /// Stop pasting whole lines: lerp `paste_p`.
+    /// Moves `paste-injection` (0.04), `whole-line-injection` (0.12), and
+    /// defuses the `physiological-floor+paste` hard rule.
+    PasteAvoidance,
+    /// Inject corrections: lerp `backspace_p`.
+    /// Moves `errorless-input` (0.04) only.
+    FakeBackspaces,
+    /// Reproduce the human's *joint temporal structure*: lerp **both**
+    /// `think_autocorr` and `think_fatigue`. Moves `gap-non-autocorrelation`
+    /// (0.22 — the single heaviest term) and `no-throughput-decay` (0.14), and
+    /// defuses the `uncorrelated-flat-throughput` hard rule. This is the
+    /// promoted Tier-3 cluster the design claims is the load-bearing robustness.
+    TemporalStructure,
+}
+
+impl Tactic {
+    /// All tactics, in a stable order (for harness/table iteration).
+    pub const ALL: [Tactic; 5] = [
+        Tactic::KeystrokeTiming,
+        Tactic::ThinkTime,
+        Tactic::PasteAvoidance,
+        Tactic::FakeBackspaces,
+        Tactic::TemporalStructure,
+    ];
+
+    /// Short human-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tactic::KeystrokeTiming => "keystroke-timing",
+            Tactic::ThinkTime => "think-time",
+            Tactic::PasteAvoidance => "paste-avoidance",
+            Tactic::FakeBackspaces => "fake-backspaces",
+            Tactic::TemporalStructure => "temporal-structure",
+        }
+    }
+}
+
+/// Build an evader that has spent effort `t ∈ [0,1]` on a **single tactic
+/// family**, leaving every other family at the naive-agent default.
+///
+/// At `t = 0` this is exactly [`ProfileParams::agent()`]; at `t = 1` only the
+/// chosen family's fields equal the human's, and all other fields still equal
+/// the agent's. This is the per-family analogue of [`evade`] (which lerps every
+/// family jointly), and it reuses the identical per-field arithmetic via
+/// [`lerp_params`] so the two paths cannot drift.
+pub fn evade_tactic(tactic: Tactic, t: f64) -> ProfileParams {
+    let a = ProfileParams::agent();
+    let h = ProfileParams::human();
+    // Start from the naive agent; move only the chosen family toward human.
+    let mut p = a.clone();
+    let lerp = |x: f64, y: f64| x + (y - x) * t;
+    let lerp2 = |x: (f64, f64), y: (f64, f64)| (lerp(x.0, y.0), lerp(x.1, y.1));
+    match tactic {
+        Tactic::KeystrokeTiming => {
+            p.keystroke_lognormal = lerp2(a.keystroke_lognormal, h.keystroke_lognormal);
+        }
+        Tactic::ThinkTime => {
+            p.think_lognormal = lerp2(a.think_lognormal, h.think_lognormal);
+        }
+        Tactic::PasteAvoidance => {
+            p.paste_p = lerp(a.paste_p, h.paste_p);
+        }
+        Tactic::FakeBackspaces => {
+            p.backspace_p = lerp(a.backspace_p, h.backspace_p);
+        }
+        Tactic::TemporalStructure => {
+            p.think_autocorr = lerp(a.think_autocorr, h.think_autocorr);
+            p.think_fatigue = lerp(a.think_fatigue, h.think_fatigue);
+        }
+    }
+    p
 }
 
 /// Score one accumulator, returning `p_agent` (or `None` if under-evidenced).
@@ -222,6 +322,366 @@ pub fn compare_models_across_evasion(
         .collect()
 }
 
+// ===========================================================================
+// Measurement A — COST-TO-EVADE
+//
+// Treat the evasion budget `e ∈ [0,1]` as the adversary's cost (fraction of
+// human-mimicry the agent must buy — by design, throughput surrender). The
+// defender's *imposed* cost is the minimal `e` at which a genuine agent session
+// stops being caught. Two escape thresholds, one per deployed decision layer:
+//
+//   * `e*_single` — minimal `e` at which the single-shot per-snapshot model no
+//     longer emits `Agent` (`p_agent < agent_threshold`).
+//   * `e*_seq`    — minimal `e` at which it also escapes the EWMA sequential
+//     escalation over a forced-long session. By construction the sequential
+//     test only ever *rescues* dead-band campers, so `e*_seq >= e*_single`; the
+//     gap is the extra cost the sequential layer imposes (THREAT_MODEL A5).
+// ===========================================================================
+
+/// One point on the agent-cohort escape curve: at evasion budget `budget`, what
+/// fraction of a genuine-agent cohort is still **caught** by each decision layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EscapeCurve {
+    /// Evasion budget `e ∈ [0,1]` the agent cohort spent (full-tactic [`evade`]).
+    pub budget: f64,
+    /// Fraction caught by the single-shot per-snapshot `Agent` verdict.
+    pub caught_single: f64,
+    /// Fraction caught by the EWMA sequential escalation (the deployed layer).
+    pub caught_seq: f64,
+}
+
+/// Cost-to-evade at one operating point (target caught-fraction `tau`),
+/// averaged across seeds. Higher `e_*` ⇒ a more robust detector (a naive agent
+/// must surrender more throughput to escape).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostToEvade {
+    /// Target caught-fraction: `e_*` is the minimal budget whose caught-fraction
+    /// drops below this (e.g. `0.5` = the median session escapes; `0.05` = the
+    /// cohort essentially escapes).
+    pub tau: f64,
+    /// Minimal budget to push the single-shot caught-fraction below `tau`.
+    pub e_single: f64,
+    /// Minimal budget to push the sequential caught-fraction below `tau`.
+    pub e_seq: f64,
+    /// `e_seq - e_single`: the extra cost the sequential test imposes (≥ 0).
+    pub seq_premium: f64,
+    /// Human cohort's sequential false-positive rate (caught-as-Agent), averaged
+    /// across seeds. Must stay ≤ α (~2%) for a high `e_*` to mean *robustness*
+    /// rather than a false-positive artifact — reported alongside as a guard.
+    pub human_seq_fp: f64,
+}
+
+/// Run an agent cohort at one budget through the *real* sequential replay and
+/// return `(caught_single, caught_seq)` fractions over the cohort.
+fn agent_caught_fractions(
+    model: &Model,
+    agent: &ProfileParams,
+    n: usize,
+    rng: &mut Rng,
+) -> (f64, f64) {
+    let cfg = crate::DetectConfig::default();
+    let mut caught_single = 0usize;
+    let mut caught_seq = 0usize;
+    for _ in 0..n {
+        let (single, seq) = run_session_sequential(
+            model,
+            agent,
+            rng,
+            cfg.ewma_alpha,
+            cfg.escalate_logit,
+            cfg.assess_every,
+        );
+        if single == aegis_sdk::Verdict::Agent {
+            caught_single += 1;
+        }
+        if seq == aegis_sdk::Verdict::Agent {
+            caught_seq += 1;
+        }
+    }
+    (
+        caught_single as f64 / n as f64,
+        caught_seq as f64 / n as f64,
+    )
+}
+
+/// Sweep the evasion budget over `grid` and return the agent-cohort escape
+/// curves (caught-fraction vs budget) for both decision layers, averaged across
+/// `seeds`. Drives the genuine `SessionAccumulator` + `Model` + EWMA via
+/// [`run_session_sequential`].
+pub fn escape_curves(
+    model: &Model,
+    n_per_class: usize,
+    seeds: &[u64],
+    grid: &[f64],
+) -> Vec<EscapeCurve> {
+    grid.iter()
+        .map(|&e| {
+            let e = e.clamp(0.0, 1.0);
+            let agent = evade(e);
+            let mut single_acc = 0.0;
+            let mut seq_acc = 0.0;
+            for &seed in seeds {
+                // Salt by budget so each (seed, budget) draw is its own stream
+                // (deterministic), matching the disjoint-draw posture elsewhere.
+                let mut rng = Rng::new(seed ^ (0xC057_0000u64).wrapping_add((e * 1000.0) as u64));
+                let (cs, cq) = agent_caught_fractions(model, &agent, n_per_class, &mut rng);
+                single_acc += cs;
+                seq_acc += cq;
+            }
+            let n = seeds.len() as f64;
+            EscapeCurve {
+                budget: e,
+                caught_single: single_acc / n,
+                caught_seq: seq_acc / n,
+            }
+        })
+        .collect()
+}
+
+/// Human-cohort sequential false-positive rate (fraction caught as `Agent`),
+/// averaged across seeds — the honesty guard for cost-to-evade.
+fn human_seq_fp_rate(model: &Model, n_per_class: usize, seeds: &[u64]) -> f64 {
+    let human = ProfileParams::human();
+    let mut acc = 0.0;
+    for &seed in seeds {
+        let mut rng = Rng::new(seed ^ 0x4055_0000u64); // "FALS" salt
+        let (_single, seq) = agent_caught_fractions(model, &human, n_per_class, &mut rng);
+        acc += seq;
+    }
+    acc / seeds.len() as f64
+}
+
+/// Minimal budget on `curve` at which `caught` first drops below `tau`, with
+/// linear interpolation between the bracketing grid points. Returns `1.0` if the
+/// caught-fraction never falls below `tau` within the grid (uncatchable only at
+/// perfect mimicry); returns `0.0` if it starts below `tau` (already escaped).
+fn crossing(curve: &[(f64, f64)], tau: f64) -> f64 {
+    if curve.is_empty() {
+        return 1.0;
+    }
+    if curve[0].1 < tau {
+        return curve[0].0;
+    }
+    for w in curve.windows(2) {
+        let (e0, c0) = w[0];
+        let (e1, c1) = w[1];
+        if c1 < tau {
+            // Linear interpolation of the budget where caught == tau.
+            let denom = c0 - c1;
+            let frac = if denom.abs() > 1e-12 {
+                ((c0 - tau) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            return e0 + (e1 - e0) * frac;
+        }
+    }
+    1.0
+}
+
+/// Compute the cost-to-evade at each target caught-fraction in `taus`.
+///
+/// Sweeps the budget `grid` once (via [`escape_curves`]), then for each `tau`
+/// finds the single-shot and sequential crossings. Also measures the human
+/// sequential false-positive rate as the honesty guard. Deterministic given
+/// `seeds`.
+pub fn cost_to_evade(
+    model: &Model,
+    n_per_class: usize,
+    seeds: &[u64],
+    grid: &[f64],
+    taus: &[f64],
+) -> Vec<CostToEvade> {
+    let curves = escape_curves(model, n_per_class, seeds, grid);
+    let single: Vec<(f64, f64)> = curves.iter().map(|c| (c.budget, c.caught_single)).collect();
+    let seq: Vec<(f64, f64)> = curves.iter().map(|c| (c.budget, c.caught_seq)).collect();
+    let human_seq_fp = human_seq_fp_rate(model, n_per_class, seeds);
+
+    taus.iter()
+        .map(|&tau| {
+            let e_single = crossing(&single, tau);
+            let e_seq = crossing(&seq, tau);
+            CostToEvade {
+                tau,
+                e_single,
+                e_seq,
+                seq_premium: (e_seq - e_single).max(0.0),
+                human_seq_fp,
+            }
+        })
+        .collect()
+}
+
+// ===========================================================================
+// Measurement B — PER-TACTIC ABLATION
+//
+// Move ONE tactic family at a time (`evade_tactic`) over effort `t ∈ [0,1]`,
+// holding the other four families at agent defaults, and measure how much
+// detection drops per unit effort. Ranks tactics by evasion efficiency,
+// validating the Tier-1-cheap / Tier-3-costly hypothesis.
+// ===========================================================================
+
+/// One effort point on a single tactic's ablation curve, averaged across seeds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TacticAblationPoint {
+    /// Effort `t ∈ [0,1]` spent on this single tactic family.
+    pub effort: f64,
+    /// Threshold-free ROC-AUC of `p_agent` on a balanced human-vs-(single-family
+    /// evaded agent) cohort. `0.5` = indistinguishable.
+    pub auc: f64,
+    /// Mean `p_agent` on the *agent* sub-cohort (the §5.5 "p_agent on a true
+    /// agent vs budget" curve, per family). Falls as the family is faked.
+    pub mean_p_agent_agent: f64,
+}
+
+/// Per-tactic ablation summary: the effort curve plus efficiency statistics.
+/// Costlier-to-fake tactics show a *smaller* drop and a *larger* area.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TacticAblation {
+    pub tactic: Tactic,
+    /// The full effort curve (`effort`, `auc`, `mean_p_agent_agent`).
+    pub points: Vec<TacticAblationPoint>,
+    /// `AUC(t=0) - AUC(t=1)`: total ranking-power surrendered by this tactic.
+    pub auc_drop: f64,
+    /// `⟨p_agent⟩(t=0) - ⟨p_agent⟩(t=1)`: total agent-evidence this tactic sheds.
+    pub p_agent_drop: f64,
+    /// `∫₀¹ ⟨p_agent⟩(t) dt` (trapezoidal): higher ⇒ the family stays
+    /// incriminating across all effort ⇒ **costlier to fake**. The per-tactic
+    /// analogue of the design's area-under-the-effort-curve headline metric.
+    pub area_p_agent: f64,
+    /// Local slope of `⟨p_agent⟩` near `t=0` (drop over the first grid step,
+    /// per unit effort): a cheap tactic bites immediately (steep), a costly one
+    /// barely moves (shallow).
+    pub near_zero_slope: f64,
+}
+
+/// Ablate a single tactic family over `effort_grid`, balancing human sessions
+/// against single-family-evaded agent sessions and scoring through the *real*
+/// pipeline. `min_commands` forces a session length so the Tier-3 robust
+/// features engage (use `0` for the natural draw).
+fn ablate_one(
+    model: &Model,
+    tactic: Tactic,
+    n_per_class: usize,
+    seeds: &[u64],
+    effort_grid: &[f64],
+    min_commands: u32,
+) -> TacticAblation {
+    let human = ProfileParams::human();
+
+    let points: Vec<TacticAblationPoint> = effort_grid
+        .iter()
+        .map(|&t| {
+            let t = t.clamp(0.0, 1.0);
+            let agent = evade_tactic(tactic, t);
+            let mut auc_acc = 0.0;
+            let mut pmean_acc = 0.0;
+            for &seed in seeds {
+                // Disjoint stream per (tactic, effort, seed).
+                let salt = (tactic as u64)
+                    .wrapping_mul(0x9E37_79B9)
+                    .wrapping_add((t * 1000.0) as u64);
+                let mut rng = Rng::new(seed ^ salt);
+                let mut scored: Vec<(f64, bool)> = Vec::with_capacity(n_per_class * 2);
+                let mut agent_ps: Vec<f64> = Vec::with_capacity(n_per_class);
+                for _ in 0..n_per_class {
+                    for (params, is_agent) in [(&human, false), (&agent, true)] {
+                        let mut acc = SessionAccumulator::default();
+                        for evt in crate::synth::synth_events(params, &mut rng, min_commands) {
+                            evt.apply(&mut acc);
+                        }
+                        if let Some(p) = score(model, &acc) {
+                            scored.push((p, is_agent));
+                            if is_agent {
+                                agent_ps.push(p);
+                            }
+                        }
+                    }
+                }
+                auc_acc += roc_auc(&scored);
+                pmean_acc += if agent_ps.is_empty() {
+                    0.0
+                } else {
+                    agent_ps.iter().sum::<f64>() / agent_ps.len() as f64
+                };
+            }
+            let n = seeds.len() as f64;
+            TacticAblationPoint {
+                effort: t,
+                auc: auc_acc / n,
+                mean_p_agent_agent: pmean_acc / n,
+            }
+        })
+        .collect();
+
+    // Trapezoidal area under ⟨p_agent⟩ vs effort over [grid.first, grid.last].
+    let area_p_agent = points
+        .windows(2)
+        .map(|w| {
+            let dt = w[1].effort - w[0].effort;
+            0.5 * (w[0].mean_p_agent_agent + w[1].mean_p_agent_agent) * dt
+        })
+        .sum();
+
+    let first = points.first().cloned().unwrap_or(TacticAblationPoint {
+        effort: 0.0,
+        auc: 0.5,
+        mean_p_agent_agent: 0.0,
+    });
+    let last = points.last().cloned().unwrap_or_else(|| first.clone());
+    let near_zero_slope = if points.len() >= 2 {
+        let a = &points[0];
+        let b = &points[1];
+        let dt = b.effort - a.effort;
+        if dt.abs() > 1e-12 {
+            (a.mean_p_agent_agent - b.mean_p_agent_agent) / dt
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    TacticAblation {
+        tactic,
+        auc_drop: first.auc - last.auc,
+        p_agent_drop: first.mean_p_agent_agent - last.mean_p_agent_agent,
+        area_p_agent,
+        near_zero_slope,
+        points,
+    }
+}
+
+/// Per-tactic ablation across all [`Tactic::ALL`] families, with the natural
+/// session-length draw (matching [`evaluate_with_evasion`]). Use
+/// [`per_tactic_ablation_min_commands`] to force longer sessions so the Tier-3
+/// robust features always engage.
+pub fn per_tactic_ablation(
+    model: &Model,
+    n_per_class: usize,
+    seeds: &[u64],
+    effort_grid: &[f64],
+) -> Vec<TacticAblation> {
+    per_tactic_ablation_min_commands(model, n_per_class, seeds, effort_grid, 0)
+}
+
+/// Per-tactic ablation forcing at least `min_commands` commands per session, so
+/// the volume-hungry Tier-3 features ([`crate::features::MIN_COMMANDS_ROBUST`])
+/// engage on every session — the robustness cross-check for the headline
+/// natural-length run.
+pub fn per_tactic_ablation_min_commands(
+    model: &Model,
+    n_per_class: usize,
+    seeds: &[u64],
+    effort_grid: &[f64],
+    min_commands: u32,
+) -> Vec<TacticAblation> {
+    Tactic::ALL
+        .iter()
+        .map(|&tactic| ablate_one(model, tactic, n_per_class, seeds, effort_grid, min_commands))
+        .collect()
+}
+
 /// ROC-AUC via the Mann–Whitney U statistic (rank method, ties averaged).
 pub fn roc_auc(scored: &[(f64, bool)]) -> f64 {
     let n_pos = scored.iter().filter(|(_, l)| *l).count();
@@ -276,8 +736,11 @@ pub fn roc_auc(scored: &[(f64, bool)]) -> f64 {
 /// agent-leaning session is latched to `Agent` once the EWMA crosses
 /// `escalate_logit`. The single-shot verdict is the terminal per-snapshot
 /// `assess`. Deterministic given `rng`; exercises the genuine feature pipeline.
-#[cfg(test)]
-pub(crate) fn run_session_sequential(
+///
+/// Public so the cost-to-evade harness (and examples) can drive the *real*
+/// sequential decision layer, not a re-implementation; the production EWMA
+/// constants live in [`crate::DetectConfig`].
+pub fn run_session_sequential(
     model: &Model,
     params: &ProfileParams,
     rng: &mut Rng,
@@ -571,6 +1034,266 @@ mod tests {
             "both models should approach chance at full mimicry: transparent {}, learned {}",
             mimic.transparent_auc,
             mimic.learned_auc
+        );
+    }
+
+    // ---- Per-tactic evasion surface (regression + construction) -----------
+
+    #[test]
+    fn evade_tactic_at_zero_is_naive_agent() {
+        // t = 0 ⇒ exactly the naive agent, for every tactic (no family moved).
+        let a = ProfileParams::agent();
+        for tac in Tactic::ALL {
+            let p = evade_tactic(tac, 0.0);
+            assert_eq!(p.keystroke_lognormal, a.keystroke_lognormal, "{tac:?}");
+            assert_eq!(p.think_lognormal, a.think_lognormal, "{tac:?}");
+            assert_eq!(p.backspace_p, a.backspace_p, "{tac:?}");
+            assert_eq!(p.paste_p, a.paste_p, "{tac:?}");
+            assert_eq!(p.think_autocorr, a.think_autocorr, "{tac:?}");
+            assert_eq!(p.think_fatigue, a.think_fatigue, "{tac:?}");
+        }
+    }
+
+    #[test]
+    fn evade_tactic_at_one_moves_only_its_family() {
+        // t = 1 ⇒ the chosen family equals the human's; every other field stays
+        // *bit-identical* to the agent's. This pins the disjoint family→field
+        // mapping. The moved fields are compared with a tiny epsilon because the
+        // lerp `a + (h-a)*1.0` is not bit-exact for floats; the unmoved fields
+        // are untouched and so must compare exactly equal.
+        let a = ProfileParams::agent();
+        let h = ProfileParams::human();
+        let close = |x: f64, y: f64| (x - y).abs() < 1e-9;
+        let close2 = |x: (f64, f64), y: (f64, f64)| close(x.0, y.0) && close(x.1, y.1);
+
+        let kt = evade_tactic(Tactic::KeystrokeTiming, 1.0);
+        assert!(close2(kt.keystroke_lognormal, h.keystroke_lognormal));
+        assert_eq!(kt.think_lognormal, a.think_lognormal);
+        assert_eq!(kt.paste_p, a.paste_p);
+        assert_eq!(kt.think_autocorr, a.think_autocorr);
+
+        let tt = evade_tactic(Tactic::ThinkTime, 1.0);
+        assert!(close2(tt.think_lognormal, h.think_lognormal));
+        assert_eq!(tt.keystroke_lognormal, a.keystroke_lognormal);
+
+        let pa = evade_tactic(Tactic::PasteAvoidance, 1.0);
+        assert!(close(pa.paste_p, h.paste_p));
+        assert_eq!(pa.backspace_p, a.backspace_p);
+
+        let fb = evade_tactic(Tactic::FakeBackspaces, 1.0);
+        assert!(close(fb.backspace_p, h.backspace_p));
+        assert_eq!(fb.paste_p, a.paste_p);
+
+        let ts = evade_tactic(Tactic::TemporalStructure, 1.0);
+        assert!(close(ts.think_autocorr, h.think_autocorr));
+        assert!(close(ts.think_fatigue, h.think_fatigue));
+        assert_eq!(ts.think_lognormal, a.think_lognormal);
+    }
+
+    #[test]
+    fn evade_joint_equals_lerp_params_refactor() {
+        // Regression pin: after refactoring `evade` onto `lerp_params`, the joint
+        // sweep must be bit-identical to lerping every field agent→human.
+        let a = ProfileParams::agent();
+        let h = ProfileParams::human();
+        for &t in &[0.0, 0.123, 0.5, 0.777, 1.0] {
+            let got = evade(t);
+            let expect = lerp_params(&a, &h, t);
+            assert_eq!(got.keystroke_lognormal, expect.keystroke_lognormal, "t={t}");
+            assert_eq!(got.think_lognormal, expect.think_lognormal, "t={t}");
+            assert_eq!(got.backspace_p, expect.backspace_p, "t={t}");
+            assert_eq!(got.paste_p, expect.paste_p, "t={t}");
+            assert_eq!(got.entropy, expect.entropy, "t={t}");
+            assert_eq!(got.commands, expect.commands, "t={t}");
+            assert_eq!(got.keystrokes_per_cmd, expect.keystrokes_per_cmd, "t={t}");
+            assert_eq!(got.think_autocorr, expect.think_autocorr, "t={t}");
+            assert_eq!(got.think_fatigue, expect.think_fatigue, "t={t}");
+        }
+    }
+
+    // ---- Cost-to-evade ----------------------------------------------------
+
+    fn fine_budget_grid() -> Vec<f64> {
+        let mut g = Vec::new();
+        let mut e = 0.0f64;
+        while e <= 1.0001 {
+            g.push((e * 50.0).round() / 50.0);
+            e += 0.02;
+        }
+        g
+    }
+
+    #[test]
+    fn cost_to_evade_is_positive_and_sequential_costs_more() {
+        // The central cost-to-evade properties, asserted over a cohort with
+        // generous bands (synth-noise-tolerant, like the sequential_* tests):
+        //   (a) a naive agent IS caught ⇒ cost-to-evade > 0;
+        //   (b) the sequential layer only ever raises the cost ⇒ e_seq >= e_single
+        //       and the premium is materially positive (the value of A5's SPRT);
+        //   (c) the human sequential false-positive rate stays ≤ α (~2%) — so a
+        //       high cost-to-evade is robustness, not an FP artifact.
+        let model = Model::default();
+        let grid = fine_budget_grid();
+        let rows = cost_to_evade(&model, 200, &[1, 2, 3], &grid, &[0.5, 0.05]);
+        assert_eq!(rows.len(), 2);
+
+        for r in &rows {
+            assert!(
+                r.e_single > 0.05,
+                "cost-to-evade must be > 0 (naive agent caught); tau={} e_single={}",
+                r.tau,
+                r.e_single
+            );
+            assert!(
+                r.e_seq + 1e-9 >= r.e_single,
+                "sequential must not lower the cost: tau={} e_seq={} e_single={}",
+                r.tau,
+                r.e_seq,
+                r.e_single
+            );
+            assert!(
+                r.human_seq_fp <= 0.02,
+                "human sequential FP must stay ≤ 2%, got {:.3}%",
+                100.0 * r.human_seq_fp
+            );
+        }
+
+        // At the median operating point the sequential premium is sizeable
+        // (empirically ≈0.23): the EWMA buys a materially higher cost-to-evade.
+        let median = rows.iter().find(|r| r.tau == 0.5).unwrap();
+        assert!(
+            median.seq_premium >= 0.10,
+            "expected a sizeable sequential premium at tau=0.5, got {}",
+            median.seq_premium
+        );
+    }
+
+    #[test]
+    fn escape_curves_are_monotone_and_seq_dominates_single() {
+        // The agent caught-fraction falls as the budget rises (more mimicry ⇒
+        // fewer caught), and the sequential layer catches at least as many as
+        // single-shot at every budget (it only rescues, never releases).
+        let model = Model::default();
+        let grid = fine_budget_grid();
+        let curves = escape_curves(&model, 200, &[1, 2, 3], &grid);
+
+        // Sequential dominates single-shot pointwise.
+        for c in &curves {
+            assert!(
+                c.caught_seq + 1e-9 >= c.caught_single,
+                "seq must dominate single at e={}: seq={} single={}",
+                c.budget,
+                c.caught_seq,
+                c.caught_single
+            );
+        }
+        // Endpoints: naive agents are essentially all caught; a perfect mimic
+        // essentially escapes both layers.
+        assert!(curves.first().unwrap().caught_single > 0.95);
+        assert!(curves.last().unwrap().caught_seq < 0.10);
+
+        // Broadly decreasing (allow small non-monotone synth wiggles by checking
+        // a coarse 0.0 → 0.6 → 1.0 trend on the sequential curve).
+        let at = |e: f64| curves.iter().find(|c| (c.budget - e).abs() < 1e-6).unwrap();
+        assert!(at(0.0).caught_seq > at(0.6).caught_seq);
+        assert!(at(0.6).caught_seq > at(1.0).caught_seq);
+    }
+
+    // ---- Per-tactic ablation (the central validation) ---------------------
+
+    #[test]
+    fn full_tactic_evasion_beats_any_single_cheap_tactic() {
+        // The Stackelberg punchline: spending budget jointly (the full mimic)
+        // sheds far more agent-evidence per unit budget than spending it all on
+        // any *single* family. At t=1 the joint evader drives mean p_agent near
+        // the human floor (~0.11) while the best single tactic stalls (~0.50),
+        // because the model's weight sits on joint structure no single marginal
+        // can carry. Asserted on the agent sub-cohort mean p_agent.
+        let model = Model::default();
+        let seeds: &[u64] = &[1, 2, 3];
+        let grid = &[0.0, 1.0];
+
+        let mean_p_full = {
+            // Full-tactic mean p_agent at t=1 via the evaluate harness' agent draw.
+            let agent = evade(1.0);
+            let mut ps = Vec::new();
+            for &seed in seeds {
+                let mut rng = Rng::new(seed ^ 0xF0FF);
+                for _ in 0..500 {
+                    let acc = synth_session(&agent, &mut rng);
+                    if let Some(p) = score(&model, &acc) {
+                        ps.push(p);
+                    }
+                }
+            }
+            ps.iter().sum::<f64>() / ps.len() as f64
+        };
+
+        let abl = per_tactic_ablation(&model, 500, seeds, grid);
+        let best_single_p = abl
+            .iter()
+            .map(|a| a.points.last().unwrap().mean_p_agent_agent)
+            .fold(f64::INFINITY, f64::min);
+
+        assert!(
+            mean_p_full + 0.15 < best_single_p,
+            "full-tactic mimic (mean p_agent {:.3}) must be markedly more evasive than the best \
+             single tactic (mean p_agent {:.3})",
+            mean_p_full,
+            best_single_p
+        );
+        // And the full mimic should land near the human floor.
+        assert!(
+            mean_p_full < 0.35,
+            "full mimic mean p_agent should approach the human band, got {mean_p_full:.3}"
+        );
+    }
+
+    #[test]
+    fn temporal_structure_is_the_costliest_single_tactic() {
+        // Validates the robust-feature design claim: of the five single tactics,
+        // TemporalStructure (autocorrelation + throughput) is the COSTLIEST to
+        // fake — it sheds the LEAST agent-evidence per unit effort (largest area
+        // under the p_agent-vs-effort curve, smallest drop). In isolation this is
+        // because moving only the temporal family leaves the other agent signals
+        // (and the hard rules) carrying the score — i.e. you must fix the JOINT
+        // structure, not one marginal. ThinkTime is the cheapest single tactic
+        // (it also defuses a hard-rule condition), so we assert the clear gap
+        // against ThinkTime and PasteAvoidance, plus the global max-area property.
+        let model = Model::default();
+        let grid: Vec<f64> = (0..=10).map(|i| i as f64 / 10.0).collect();
+        let abl = per_tactic_ablation(&model, 600, &[1, 2, 3], &grid);
+
+        let get = |t: Tactic| abl.iter().find(|a| a.tactic == t).unwrap();
+        let ts = get(Tactic::TemporalStructure);
+        let tt = get(Tactic::ThinkTime);
+        let pa = get(Tactic::PasteAvoidance);
+
+        // (a) TemporalStructure has the maximum area of all five tactics.
+        let max_area = abl
+            .iter()
+            .map(|a| a.area_p_agent)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (ts.area_p_agent - max_area).abs() < 1e-9,
+            "TemporalStructure must have the max p_agent area (costliest); areas: {:?}",
+            abl.iter()
+                .map(|a| (a.tactic.label(), a.area_p_agent))
+                .collect::<Vec<_>>()
+        );
+
+        // (b) TemporalStructure sheds far less evidence than the cheapest tactics.
+        assert!(
+            ts.p_agent_drop + 0.10 < tt.p_agent_drop,
+            "TemporalStructure (drop {:.3}) must be much costlier than ThinkTime (drop {:.3})",
+            ts.p_agent_drop,
+            tt.p_agent_drop
+        );
+        assert!(
+            ts.p_agent_drop < pa.p_agent_drop,
+            "TemporalStructure (drop {:.3}) must be costlier than PasteAvoidance (drop {:.3})",
+            ts.p_agent_drop,
+            pa.p_agent_drop
         );
     }
 }

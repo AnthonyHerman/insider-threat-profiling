@@ -151,6 +151,7 @@ section.
 
 **Project**
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution workflow and conventions.
+- [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) — how Aegis was built: the multi-agent, workflow-driven process.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 - [`docs/paper/paper.md`](docs/paper/paper.md) — the research paper.
 - [`docs/blog/blog.md`](docs/blog/blog.md) — the blog post.
@@ -166,12 +167,17 @@ enrollment, mTLS forwarding, server-side detection — has been exercised on a r
 Linux host distinct from the build machine (see
 [`docs/linode-integration.md`](docs/linode-integration.md)).
 
-CI on every push/PR runs `rustfmt`, `clippy -D warnings`, and the workspace
-build + tests (`--locked`), and a dedicated job builds the static musl `aegisd`
-and asserts it is statically linked. A full security audit
-([`docs/security-audit.md`](docs/security-audit.md)) has been completed with
-findings remediated against source. This is research-grade software; see the
-threat model and design docs for scope, assumptions, and known limitations.
+CI on every push/PR runs `rustfmt`, `clippy -D warnings`, the workspace
+build + tests (`--locked`), and a reproducibility gate that regenerates the
+evaluation results and fails on drift; a dedicated job builds the static musl
+`aegisd` and asserts it is statically linked. A full security audit
+([`docs/security-audit.md`](docs/security-audit.md)) has been completed and its
+findings remediated against source — 26 of 28 are fixed, with the two remaining
+(most notably the dynamic-loader cryptographic integrity gate) tracked as open
+hardening items. How the platform was built — a multi-agent, workflow-driven
+process — is documented in [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md). This is
+research-grade software; see the threat model and design docs for scope,
+assumptions, and known limitations.
 
 ## License
 
