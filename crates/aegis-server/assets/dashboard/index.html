@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aegis</title>
+    <!--
+      Self-contained operator dashboard shell.
+
+      Self-containment is a hard constraint: every asset referenced here ships
+      *inside* the aegisd binary (embedded via rust-embed) and is served from
+      this same origin. There are NO external/CDN references and NO network
+      dependencies. Because api.rs sets a strict Content-Security-Policy
+      (`default-src 'self'`) on every response, inline <script> and inline
+      <style> are forbidden, so the stylesheet (app.css) and behaviour (app.js)
+      are separate same-origin files rather than inlined — which is what keeps
+      the page self-contained while remaining CSP-compatible.
+
+      app.js polls the read-only JSON API (/api/v1/{agents,detections,scores,
+      alerts,server-info}) and subscribes to the live feed at /api/v1/live via
+      EventSource to update the tables in place.
+    -->
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">&#9670;</span>
+        <h1>Aegis</h1>
+        <span class="subtitle">operator console</span>
+      </div>
+      <div class="status" id="conn-status" data-state="connecting">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="conn-label">connecting&hellip;</span>
+      </div>
+    </header>
+
+    <section class="stats" id="stats" aria-label="summary">
+      <div class="stat">
+        <span class="stat-value" id="stat-agents">&mdash;</span>
+        <span class="stat-label">agents</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="stat-subjects">&mdash;</span>
+        <span class="stat-label">subjects</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="stat-agent-verdicts">&mdash;</span>
+        <span class="stat-label">agent verdicts</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="stat-alerts">&mdash;</span>
+        <span class="stat-label">unacked alerts</span>
+      </div>
+      <div class="stat stat-meta">
+        <span class="stat-value mono" id="stat-fingerprint" title="server certificate fingerprint">&mdash;</span>
+        <span class="stat-label">cert fingerprint &middot; proto <span id="stat-proto">&mdash;</span></span>
+      </div>
+    </section>
+
+    <main>
+      <!--
+        Primary table: one row per subject, joining the latest human-vs-agent
+        verdict (+ confidence) with the latest risk score, grouped by agent.
+      -->
+      <section class="panel" aria-labelledby="subjects-h">
+        <div class="panel-head">
+          <h2 id="subjects-h">Subjects &mdash; verdict &amp; risk</h2>
+          <div class="controls">
+            <input
+              type="search"
+              id="subject-filter"
+              placeholder="filter by agent / subject&hellip;"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <label class="check">
+              <input type="checkbox" id="agents-only" />
+              agent-classified only
+            </label>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="subjects-table">
+            <thead>
+              <tr>
+                <th scope="col">Agent</th>
+                <th scope="col">Subject</th>
+                <th scope="col">Verdict</th>
+                <th scope="col" class="num">Confidence</th>
+                <th scope="col" class="num">Risk score</th>
+                <th scope="col">Updated</th>
+              </tr>
+            </thead>
+            <tbody id="subjects-body">
+              <tr class="empty"><td colspan="6">loading&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="two-col">
+        <!-- Live alert feed, with acknowledge actions. -->
+        <section class="panel" aria-labelledby="alerts-h">
+          <div class="panel-head">
+            <h2 id="alerts-h">Alerts</h2>
+            <label class="check">
+              <input type="checkbox" id="alerts-unacked" />
+              unacknowledged only
+            </label>
+          </div>
+          <div class="table-wrap">
+            <table id="alerts-table">
+              <thead>
+                <tr>
+                  <th scope="col">Severity</th>
+                  <th scope="col">Title</th>
+                  <th scope="col">Agent</th>
+                  <th scope="col">When</th>
+                  <th scope="col" class="num">Ack</th>
+                </tr>
+              </thead>
+              <tbody id="alerts-body">
+                <tr class="empty"><td colspan="5">loading&hellip;</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Enrolled agents and their liveness. -->
+        <section class="panel" aria-labelledby="agents-h">
+          <div class="panel-head">
+            <h2 id="agents-h">Agents</h2>
+          </div>
+          <div class="table-wrap">
+            <table id="agents-table">
+              <thead>
+                <tr>
+                  <th scope="col">Hostname</th>
+                  <th scope="col">OS</th>
+                  <th scope="col">Agent ID</th>
+                  <th scope="col">Last seen</th>
+                </tr>
+              </thead>
+              <tbody id="agents-body">
+                <tr class="empty"><td colspan="4">loading&hellip;</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <span>Aegis &mdash; self-contained insider-threat console.</span>
+      <span id="last-update" class="mono"></span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>

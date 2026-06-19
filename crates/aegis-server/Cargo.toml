@@ -31,6 +31,15 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# HTTP/JSON operator API + SSE + embedded dashboard (api.rs, dashboard.rs).
+# axum's own Router/middleware suffice; `tower` is pulled in only as a dev-dep
+# for ServiceExt::oneshot in the API tests (no network). `futures` provides the
+# stream adapter that turns a broadcast::Receiver into the SSE event stream.
+axum.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
+futures.workspace = true
+
 # Embedded storage (store.rs): pure-Rust single-file KV + compact row encoding.
 redb.workspace = true
 postcard.workspace = true
@@ -50,3 +59,7 @@ base64.workspace = true
 [dev-dependencies]
 # Unit tests open a redb database in a throwaway directory.
 tempfile = "3"
+# API tests drive the axum Router in-process (no network) via
+# `tower::ServiceExt::oneshot`; `http-body-util` collects the response body.
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"

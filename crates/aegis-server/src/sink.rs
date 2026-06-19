@@ -45,7 +45,9 @@ use std::time::Duration;
 
 use aegis_sdk::{Event, Plugin, PluginContext, PluginKind, PluginMetadata, Subscriptions};
 use async_trait::async_trait;
+use tokio::sync::broadcast;
 
+use crate::api::LiveEvent;
 use crate::store::{AlertRow, DetectionRow, ScoreRow, Store, RETENTION_NS};
 
 /// How often the retention/compaction task runs. Telemetry retention is coarse
@@ -54,17 +56,24 @@ use crate::store::{AlertRow, DetectionRow, ScoreRow, Store, RETENTION_NS};
 const COMPACT_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// The plugin that persists derived events (and `heartbeat`s) to the embedded
-/// [`Store`]. Holds only a shared [`Store`] handle; cloning the handle is cheap
-/// (it shares one `Arc<Mutex<Database>>` and file lock with ingest and the read
-/// path).
+/// [`Store`] *and* publishes each one onto the live event bus for the HTTP SSE
+/// stream. Holds a shared [`Store`] handle (cheap to clone — it shares one
+/// `Arc<Mutex<Database>>` and file lock with ingest and the read path) and a
+/// [`broadcast::Sender`] whose receivers are the connected `/api/v1/live`
+/// clients.
 pub struct StoreSink {
     store: Arc<Store>,
+    /// Fan-out for the SSE live feed. Cloned from the same channel the HTTP
+    /// `AppState` subscribes to; a publish with zero subscribers is not an
+    /// error (the `send` result is deliberately discarded).
+    live_tx: broadcast::Sender<LiveEvent>,
 }
 
 impl StoreSink {
-    /// Build a sink over a shared store handle.
-    pub fn new(store: Arc<Store>) -> Self {
-        StoreSink { store }
+    /// Build a sink over a shared store handle and the live-event fan-out
+    /// channel shared with the HTTP layer.
+    pub fn new(store: Arc<Store>, live_tx: broadcast::Sender<LiveEvent>) -> Self {
+        StoreSink { store, live_tx }
     }
 }
 
@@ -123,6 +132,16 @@ impl Plugin for StoreSink {
             "detection" => {
                 if let Some(row) = DetectionRow::from_event(event) {
                     self.store.upsert_detection(&row)?;
+                    // Publish onto the live feed only after the durable write.
+                    self.live_tx
+                        .send(LiveEvent::Detection {
+                            agent_id: row.agent_id,
+                            subject: row.subject,
+                            verdict: row.verdict,
+                            confidence: row.confidence,
+                            ts_ns: row.ts_ns,
+                        })
+                        .ok();
                 } else {
                     tracing::warn!(
                         kind = %event.kind,
@@ -133,6 +152,14 @@ impl Plugin for StoreSink {
             "score" => {
                 if let Some(row) = ScoreRow::from_event(event) {
                     self.store.upsert_score(&row)?;
+                    self.live_tx
+                        .send(LiveEvent::Score {
+                            agent_id: row.agent_id,
+                            subject: row.subject,
+                            score: row.score,
+                            ts_ns: row.ts_ns,
+                        })
+                        .ok();
                 } else {
                     tracing::warn!(
                         kind = %event.kind,
@@ -143,6 +170,15 @@ impl Plugin for StoreSink {
             "alert" => {
                 if let Some(row) = AlertRow::from_event(event) {
                     self.store.append_alert(&row)?;
+                    self.live_tx
+                        .send(LiveEvent::Alert {
+                            agent_id: row.agent_id,
+                            severity: row.severity,
+                            title: row.title,
+                            subject: row.subject,
+                            ts_ns: row.ts_ns,
+                        })
+                        .ok();
                 } else {
                     tracing::warn!(
                         kind = %event.kind,
@@ -152,6 +188,22 @@ impl Plugin for StoreSink {
             }
             "heartbeat" => {
                 self.store.touch_agent(&event.agent_id, event.ts_ns)?;
+                // Carry the hostname onto the live feed if the agent is
+                // enrolled; a heartbeat from an unknown agent yields None and is
+                // still published (the dashboard treats it as a liveness ping).
+                let hostname = self
+                    .store
+                    .agent(&event.agent_id)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.hostname);
+                self.live_tx
+                    .send(LiveEvent::AgentSeen {
+                        agent_id: event.agent_id.clone(),
+                        hostname,
+                        ts_ns: event.ts_ns,
+                    })
+                    .ok();
             }
             // We only subscribe to the four kinds above; anything else here is a
             // routing surprise. Log it (it was already written to the audit log).
@@ -194,7 +246,10 @@ mod tests {
     fn sink_with_store() -> (TempDir, Arc<Store>, StoreSink) {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
-        let sink = StoreSink::new(store.clone());
+        // A throwaway live-event channel; the receiver is dropped, so publishes
+        // are no-ops (zero subscribers is not an error).
+        let (live_tx, _) = broadcast::channel(16);
+        let sink = StoreSink::new(store.clone(), live_tx);
         (dir, store, sink)
     }
 
@@ -202,7 +257,8 @@ mod tests {
     fn metadata_and_subscriptions_are_correct() {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
-        let sink = StoreSink::new(store);
+        let (live_tx, _) = broadcast::channel(16);
+        let sink = StoreSink::new(store, live_tx);
 
         let md = sink.metadata();
         assert_eq!(md.name, "store-sink");
@@ -303,6 +359,43 @@ mod tests {
         assert_eq!(alerts[0].severity, "critical");
         assert_eq!(alerts[0].title, "automation detected");
         assert!(!alerts[0].acknowledged);
+    }
+
+    #[tokio::test]
+    async fn handle_publishes_live_event_to_subscriber() {
+        // A subscriber on the live channel must receive the matching LiveEvent
+        // after the durable write.
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let (live_tx, mut live_rx) = broadcast::channel(16);
+        let sink = StoreSink::new(store.clone(), live_tx);
+        let ctx = ctx(dir.path());
+
+        let ev = Event::new(
+            "agent-1",
+            "plugin-scoring",
+            EventPayload::Score {
+                subject: "tty-7".into(),
+                model: "risk/v1".into(),
+                score: 73.5,
+                features: BTreeMap::new(),
+            },
+        );
+        sink.handle(&ev, &ctx).await.unwrap();
+
+        match live_rx.try_recv().expect("a live event was published") {
+            LiveEvent::Score {
+                agent_id,
+                subject,
+                score,
+                ..
+            } => {
+                assert_eq!(agent_id, "agent-1");
+                assert_eq!(subject, "tty-7");
+                assert_eq!(score, 73.5);
+            }
+            other => panic!("unexpected live event: {other:?}"),
+        }
     }
 
     #[tokio::test]

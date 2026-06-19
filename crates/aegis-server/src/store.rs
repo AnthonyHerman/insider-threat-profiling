@@ -589,6 +589,104 @@ impl Store {
         Ok(out)
     }
 
+    /// All latest-per-subject risk scores, in arbitrary (key) order.
+    ///
+    /// Iterates the whole `scores` table; the HTTP layer filters/limits the
+    /// returned `Vec` in the handler. The number of rows is bounded by the count
+    /// of distinct `(agent_id, subject)` cells, not by event volume.
+    pub fn scores(&self) -> anyhow::Result<Vec<ScoreRow>> {
+        let db = self.lock();
+        let rtxn = db.begin_read()?;
+        let t = rtxn.open_table(SCORES)?;
+        let mut out = Vec::new();
+        for entry in t.range::<&str>(..)? {
+            let (_k, v) = entry?;
+            out.push(postcard::from_bytes(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// All latest-per-subject risk scores for one agent.
+    ///
+    /// Filters [`scores`](Self::scores) on `row.agent_id`. The keys are
+    /// `"{agent_id}:{subject}"`, so a prefix range (`format!("{agent_id}:")..`)
+    /// would be a cheap post-MVP optimisation; the linear filter is fine while
+    /// the per-agent subject count is small.
+    pub fn scores_for_agent(&self, agent_id: &str) -> anyhow::Result<Vec<ScoreRow>> {
+        Ok(self
+            .scores()?
+            .into_iter()
+            .filter(|r| r.agent_id == agent_id)
+            .collect())
+    }
+
+    /// All latest-per-subject detections, in arbitrary (key) order.
+    pub fn detections(&self) -> anyhow::Result<Vec<DetectionRow>> {
+        let db = self.lock();
+        let rtxn = db.begin_read()?;
+        let t = rtxn.open_table(DETECTIONS)?;
+        let mut out = Vec::new();
+        for entry in t.range::<&str>(..)? {
+            let (_k, v) = entry?;
+            out.push(postcard::from_bytes(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// All latest-per-subject detections for one agent (see
+    /// [`scores_for_agent`](Self::scores_for_agent) for the filtering note).
+    pub fn detections_for_agent(&self, agent_id: &str) -> anyhow::Result<Vec<DetectionRow>> {
+        Ok(self
+            .detections()?
+            .into_iter()
+            .filter(|r| r.agent_id == agent_id)
+            .collect())
+    }
+
+    /// Mark an alert acknowledged by its `id`, returning whether it was found.
+    ///
+    /// [`AlertRow::id`] is a *field*, not the row key (the key is the 24-byte
+    /// `composite_key(ts_ns, uuid)`), so this scans the `alerts` table for the
+    /// matching `id`, flips `acknowledged`, and re-inserts the row under its
+    /// original composite key (rebuilt from `row.ts_ns` and the parsed `id`).
+    /// Returns `Ok(true)` if an alert was acknowledged, `Ok(false)` if no alert
+    /// has that `id` (the HTTP layer maps `false` to 404).
+    ///
+    /// This is an O(n) scan over the alert log; the post-MVP fix is a secondary
+    /// `alert_id → composite_key` index table so ack is a single point lookup.
+    pub fn acknowledge_alert(&self, id: &str) -> anyhow::Result<bool> {
+        let db = self.lock();
+        let wtxn = db.begin_write()?;
+        let acked;
+        {
+            let mut t = wtxn.open_table(ALERTS)?;
+            // Find the matching row (owned) and its composite key before any
+            // mutable insert; the read guard borrows the table immutably.
+            let mut found: Option<AlertRow> = None;
+            for entry in t.range::<&[u8]>(..)? {
+                let (_k, v) = entry?;
+                let row: AlertRow = postcard::from_bytes(v.value())?;
+                if row.id == id {
+                    found = Some(row);
+                    break;
+                }
+            }
+            acked = match found {
+                Some(mut row) => {
+                    row.acknowledged = true;
+                    let uuid = Uuid::parse_str(&row.id).unwrap_or_else(|_| Uuid::new_v4());
+                    let key = composite_key(row.ts_ns, uuid);
+                    let bytes = postcard::to_allocvec(&row)?;
+                    t.insert(&key[..], &bytes[..])?;
+                    true
+                }
+                None => false,
+            };
+        }
+        wtxn.commit()?;
+        Ok(acked)
+    }
+
     // --- Retention / compaction ------------------------------------------
 
     /// Prune append-only logs older than `retention_ns` and defragment the file.
@@ -1019,6 +1117,82 @@ mod tests {
         // u64::MAX retention => now - retention underflows => skip pruning.
         store.compact(u64::MAX).unwrap();
         assert_eq!(store.events_for_agent("a", 0, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scores_and_detections_list_all_and_filter_by_agent() {
+        let (_dir, store) = open_tmp();
+        // Two agents, one shared bare subject; the composite key prevents
+        // collisions, so each agent has its own cell.
+        for (agent, score) in [("a", 10.0), ("b", 20.0)] {
+            store
+                .upsert_score(&ScoreRow {
+                    agent_id: agent.into(),
+                    subject: "s1".into(),
+                    model: "risk/v1".into(),
+                    score,
+                    ts_ns: 1,
+                })
+                .unwrap();
+            store
+                .upsert_detection(&DetectionRow {
+                    agent_id: agent.into(),
+                    subject: "s1".into(),
+                    verdict: Verdict::Uncertain.to_string(),
+                    confidence: 0.5,
+                    model: "m".into(),
+                    reasons: vec![],
+                    ts_ns: 1,
+                })
+                .unwrap();
+        }
+
+        // Collection reads see both agents' cells.
+        assert_eq!(store.scores().unwrap().len(), 2);
+        assert_eq!(store.detections().unwrap().len(), 2);
+
+        // Per-agent reads filter on agent_id.
+        let a_scores = store.scores_for_agent("a").unwrap();
+        assert_eq!(a_scores.len(), 1);
+        assert_eq!(a_scores[0].score, 10.0);
+        let b_dets = store.detections_for_agent("b").unwrap();
+        assert_eq!(b_dets.len(), 1);
+        assert_eq!(b_dets[0].agent_id, "b");
+
+        // An agent with no cells yields empty vectors, not an error.
+        assert!(store.scores_for_agent("ghost").unwrap().is_empty());
+        assert!(store.detections_for_agent("ghost").unwrap().is_empty());
+    }
+
+    #[test]
+    fn acknowledge_alert_flips_and_returns_false_on_unknown() {
+        let (_dir, store) = open_tmp();
+        let id = Uuid::new_v4().to_string();
+        store
+            .append_alert(&AlertRow {
+                id: id.clone(),
+                agent_id: "a".into(),
+                severity: "high".into(),
+                title: "t".into(),
+                detail: "d".into(),
+                subject: Some("s1".into()),
+                ts_ns: 500,
+                acknowledged: false,
+            })
+            .unwrap();
+
+        // Acking a known id flips the flag and reports success.
+        assert!(store.acknowledge_alert(&id).unwrap());
+        let after = store.alerts_recent(10).unwrap();
+        assert_eq!(after.len(), 1, "ack must not duplicate the row");
+        assert!(after[0].acknowledged);
+        assert_eq!(after[0].id, id, "re-inserted under the same logical row");
+
+        // Acking it again is still Ok(true) (idempotent flip).
+        assert!(store.acknowledge_alert(&id).unwrap());
+
+        // An unknown id reports false (mapped to 404 by the API).
+        assert!(!store.acknowledge_alert("does-not-exist").unwrap());
     }
 
     #[test]

@@ -17,11 +17,15 @@ use std::sync::Arc;
 use aegis_core::{Host, HostBuilder, HostConfig};
 use clap::{Parser, Subcommand};
 
-// Server data-path modules. The embedded store, TLS ingest listener,
-// enrollment, the store sink, and the live command router land here; the HTTP
-// API is layered in by its own workflow. `run()` does not yet reference every
-// item (e.g. token CRUD and the read path are consumed by the future HTTP API),
-// so allow dead code until those callers land.
+// Server data-path modules: the embedded store, the TLS ingest listener,
+// enrollment, the store sink, the live command router, the HTTP/JSON operator
+// API, and the embedded dashboard assets. `run()` does not exercise every item
+// directly (some read-path/CRUD methods are reached only over HTTP, and the
+// session-auth helpers only from the ingest state machine), so a few `dead_code`
+// allows remain on the modules whose surface is wider than `run()` touches.
+#[allow(dead_code)]
+mod api;
+mod dashboard;
 #[allow(dead_code)]
 mod enroll;
 #[allow(dead_code)]
@@ -96,23 +100,43 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let store = Arc::new(store::Store::open(&data_dir)?);
 
     // The in-memory live-connection table: connected agent_id -> command channel.
-    // Cloned into each ingest connection task (and, later, the HTTP AppState).
+    // Cloned into each ingest connection task and the HTTP AppState.
     let router = registry::Router::new();
+
+    // Live-event fan-out for the SSE feed: the store sink publishes derived
+    // events onto it; the HTTP `/api/v1/live` handler subscribes. The retained
+    // sender lives in `AppState`; the initial receiver is dropped (subscribers
+    // are created per connection).
+    let (live_tx, _) =
+        tokio::sync::broadcast::channel::<api::LiveEvent>(api::LIVE_CHANNEL_CAPACITY);
+
+    // Bootstrap (or load) the server TLS cert once here so its SHA-256 pin — the
+    // value agents pin and `/api/v1/server-info` exposes — is available for
+    // `AppState`. `ingest::serve` loads the same (now-existing) PEM idempotently.
+    let (_chain, _key, pin) = ingest::load_or_create_server_cert(&data_dir)?;
+    let server_info = api::ServerInfo {
+        fingerprint: hex::encode(pin),
+        proto_version: aegis_proto::PROTO_VERSION,
+    };
 
     let mut config = HostConfig::new("aegisd");
     config.data_dir = data_dir.clone();
     // The server does not collect local telemetry; it processes ingested events.
     // Build the host with the store sink as an explicit plugin (highest
     // precedence), while keeping discovery of the statically-linked central
-    // processors (agent-vs-human detection, risk scoring) on by default.
+    // processors (agent-vs-human detection, risk scoring) on by default. The
+    // sink also publishes each derived event onto the live SSE channel.
     let host = HostBuilder::new(config)
-        .with_plugin(Box::new(sink::StoreSink::new(store.clone())))
+        .with_plugin(Box::new(sink::StoreSink::new(
+            store.clone(),
+            live_tx.clone(),
+        )))
         .build()?;
     tracing::info!(
         plugins = ?host.plugin_names(),
         listen = %args.listen,
         http = %args.http,
-        "starting aegisd (ingest listener up; dashboard added by HTTP workflow)"
+        "starting aegisd (ingest listener + HTTP API/dashboard)"
     );
 
     // Start the host: spawns the dispatcher + per-plugin tasks (including the
@@ -126,28 +150,35 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         args.listen.clone(),
         data_dir,
         running.emitter(),
-        store,
+        store.clone(),
         router.clone(),
     )?;
 
-    // NOTE: the HTTP API + dashboard are wired by a separate workflow:
-    //   let http_handle = api::serve(args.http, AppState { store, router, .. })?;
-    // Until then, the --http flag is accepted but unused; surface that.
-    tracing::warn!(
-        http = %args.http,
-        "HTTP API/dashboard not yet wired; --http is currently unused"
-    );
+    // Spawn the operator HTTP API + embedded dashboard on the loopback address.
+    // It is read-mostly over the shared store, dispatches commands via the live
+    // router, and serves the SSE feed off `live_tx`.
+    let state = api::AppState {
+        store,
+        router,
+        live_tx,
+        server_info,
+    };
+    let http_handle = api::serve(args.http.clone(), state).await?;
+    tracing::info!(http = %args.http, "HTTP API/dashboard listening");
 
     tracing::info!("aegisd running; press Ctrl-C to stop");
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down aegisd");
 
-    // Stop the network listener and its in-flight connection tasks first so no
-    // new events arrive on the bus, then drain and shut down the host (which
-    // also stops the sink's retention task via the shutdown signal). The store's
-    // file lock is released when the last `Arc<Store>` clone drops at end of run.
+    // Stop the network ingress (TLS ingest) and the HTTP server first so no new
+    // events arrive on the bus and no new HTTP requests are served, then drain
+    // and shut down the host (which also stops the sink's retention task via the
+    // shutdown signal). The store's file lock is released when the last
+    // `Arc<Store>` clone drops at end of run.
     ingest_handle.abort();
     let _ = ingest_handle.await;
+    http_handle.abort();
+    let _ = http_handle.await;
     running.shutdown().await?;
     Ok(())
 }
