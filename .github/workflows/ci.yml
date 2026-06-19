@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build
+        run: cargo build --workspace --locked
+      - name: test
+        run: cargo test --workspace --locked
+
+  static-server:
+    name: self-contained server (static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl tooling
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install toolchain + musl target
+        run: |
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      - name: Build static aegisd
+        run: cargo build --release --bin aegisd --target x86_64-unknown-linux-musl --locked
+      - name: Verify the binary is statically linked
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/aegisd
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -qiE "not a dynamic executable|statically linked"; then
+            echo "OK: aegisd is statically linked (self-contained)"
+          else
+            echo "FAIL: aegisd has dynamic dependencies:"; ldd "$BIN"; exit 1
+          fi
+      - name: Upload static server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegisd-static-x86_64-musl
+          path: target/x86_64-unknown-linux-musl/release/aegisd
+          if-no-files-found: error

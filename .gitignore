@@ -1,0 +1,33 @@
+# Rust
+/target
+**/target
+Cargo.lock.orig
+*.rs.bk
+
+# Aegis runtime artifacts
+*.db
+*.redb
+*.aegis
+/data
+/run
+*.pem
+*.key
+*.crt
+!docs/**/*.key
+enrollment.token
+agent_state/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*~
+
+# Build outputs we ship separately
+/dist
+/release-artifacts
+
+# Secrets
+.env
+secrets/
