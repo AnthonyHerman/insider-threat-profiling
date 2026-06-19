@@ -8,8 +8,10 @@
 //! [`Detection`](aegis_sdk::EventPayload::Detection) verdict via the
 //! [transparent model](model).
 
+pub mod eval;
 pub mod features;
 pub mod model;
+pub mod synth;
 
 use aegis_sdk::{
     register_plugin, Event, EventPayload, Plugin, PluginContext, PluginKind, PluginMetadata,
