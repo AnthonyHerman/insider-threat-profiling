@@ -124,7 +124,11 @@ impl Plugin for TransportPlugin {
         };
 
         let state = ActorState {
-            agent_id: ctx.agent_id.clone(),
+            // Authenticate the session as the SERVER-ASSIGNED identity from
+            // enrollment (the UUID the server stored), NOT the local host-config
+            // agent_id — otherwise ClientHello is rejected as "unknown agent" and
+            // the channel-bound auth digest would not match.
+            agent_id: identity.agent_id.clone(),
             data_dir: ctx.data_dir.clone(),
             cfg,
             identity,
