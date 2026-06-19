@@ -48,7 +48,10 @@ impl std::fmt::Debug for Enrolled {
         // Never print the signing key.
         f.debug_struct("Enrolled")
             .field("agent_id", &self.agent_id)
-            .field("server_pins", &self.server_pins.iter().map(hex::encode).collect::<Vec<_>>())
+            .field(
+                "server_pins",
+                &self.server_pins.iter().map(hex::encode).collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -66,8 +69,8 @@ pub fn load(data_dir: &Path) -> anyhow::Result<Option<Enrolled>> {
     if !id_path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&id_path)
-        .with_context(|| format!("reading {}", id_path.display()))?;
+    let text =
+        fs::read_to_string(&id_path).with_context(|| format!("reading {}", id_path.display()))?;
     let parsed: IdentityFile =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", id_path.display()))?;
 
@@ -81,8 +84,8 @@ pub fn load(data_dir: &Path) -> anyhow::Result<Option<Enrolled>> {
 
     let mut server_pins = Vec::with_capacity(parsed.server_pins.len());
     for (i, p) in parsed.server_pins.iter().enumerate() {
-        let pin = pin::parse_pin_hex(p)
-            .ok_or_else(|| anyhow!("server_pins[{i}] is not 64-char hex"))?;
+        let pin =
+            pin::parse_pin_hex(p).ok_or_else(|| anyhow!("server_pins[{i}] is not 64-char hex"))?;
         server_pins.push(pin);
     }
     if server_pins.is_empty() {
@@ -105,8 +108,7 @@ pub fn persist(
     signing_key: &SigningKey,
     pins: &[[u8; PIN_LEN]],
 ) -> anyhow::Result<()> {
-    fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating {}", data_dir.display()))?;
+    fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
 
     let file = IdentityFile {
         agent_id: agent_id.to_string(),
@@ -160,8 +162,8 @@ pub fn parse_enroll_blob(line: &str) -> anyhow::Result<(String, [u8; PIN_LEN])> 
         ));
     }
     let split = raw.len() - PIN_LEN;
-    let token = String::from_utf8(raw[..split].to_vec())
-        .context("enroll token is not valid UTF-8")?;
+    let token =
+        String::from_utf8(raw[..split].to_vec()).context("enroll token is not valid UTF-8")?;
     let pin: [u8; PIN_LEN] = raw[split..].try_into().expect("checked length");
     Ok((token, pin))
 }
@@ -169,7 +171,9 @@ pub fn parse_enroll_blob(line: &str) -> anyhow::Result<(String, [u8; PIN_LEN])> 
 /// Read and parse an enroll blob from an open reader (stdin or a file).
 pub fn read_enroll_blob<R: Read>(mut reader: R) -> anyhow::Result<(String, [u8; PIN_LEN])> {
     let mut buf = String::new();
-    reader.read_to_string(&mut buf).context("reading enroll blob")?;
+    reader
+        .read_to_string(&mut buf)
+        .context("reading enroll blob")?;
     parse_enroll_blob(&buf)
 }
 

@@ -240,7 +240,9 @@ mod tests {
         let dir = tmp("unenrolled");
         let mut p = TransportPlugin::default();
         let c = ctx(dir.clone(), serde_json::json!({ "server": "" }));
-        p.init(&c).await.expect("init must not fail when unenrolled");
+        p.init(&c)
+            .await
+            .expect("init must not fail when unenrolled");
 
         // Offer some events through handle.
         for i in 0..5 {
@@ -253,7 +255,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let spill = spill::Spill::open(&dir.join("spill.redb")).unwrap();
-        assert!(spill.len().unwrap() >= 1, "events should be buffered to disk");
+        assert!(
+            spill.len().unwrap() >= 1,
+            "events should be buffered to disk"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -175,12 +175,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => run(args).await,
         Command::Install(args) => {
-            // The privileged installer is completed by the hardening workflow.
             let spec = plugin_tamper::install::InstallSpec {
                 install_path: args.install_path,
                 server_url: args.server,
                 ..Default::default()
             };
+            // Show the units that are being installed (useful for the operator).
             println!(
                 "--- aegis-agent.service ---\n{}",
                 plugin_tamper::install::render_service_unit(&spec)
@@ -189,22 +189,28 @@ async fn main() -> anyhow::Result<()> {
                 "--- aegis-guardian.service ---\n{}",
                 plugin_tamper::install::render_guardian_unit(&spec)
             );
+            // Perform the privileged install (copy, write units, daemon-reload,
+            // enable --now, set immutable). Requires root; errors are surfaced.
+            plugin_tamper::install::install(&spec)?;
             println!(
-                "\nGenerated unit files above. Privileged installation (copy, chattr +i, \
-                 systemctl enable) is performed by the hardening workflow."
+                "Installed {}; units enabled and protected files made immutable.",
+                spec.install_path
             );
             Ok(())
         }
         Command::Uninstall => {
-            println!("Authenticated uninstall is implemented by the hardening workflow.");
+            // Paths default to the install layout; uninstall reads the install
+            // token to target the exact installed paths. Requires root (uid 0):
+            // the authenticated administrator escape hatch.
+            let spec = plugin_tamper::install::InstallSpec::default();
+            plugin_tamper::install::uninstall(&spec)?;
+            println!("Uninstalled aegis-agent (immutable cleared, units disabled, files removed).");
             Ok(())
         }
         Command::Guard { service } => {
-            tracing::info!(
-                service,
-                "guardian mode: watchdog implemented by hardening workflow"
-            );
-            Ok(())
+            tracing::info!(service, "guardian mode: watching service liveness");
+            // Blocks forever, reviving the service if systemd reports it inactive.
+            plugin_tamper::install::guard(&service, std::time::Duration::from_secs(2));
         }
         Command::Enroll(args) => enroll(args).await,
         Command::Shell(args) => shell(args).await,
@@ -234,6 +240,22 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
+    // Wire the tamper plugin to the standard hardened-install layout so the
+    // immutable-bit watch, the missing-file fallback, and the startup
+    // "files not immutable" posture check are all live in the deployed service.
+    // Without this, `run` (the unit's ExecStart) leaves `protected_paths` empty,
+    // so only the manifest content-check runs and the immutable bit is never
+    // verified at runtime. The operator can still override either field via a
+    // `--config` TOML: we only fill keys that are absent.
+    //
+    // Gated on running as root (the deployed posture): an unprivileged dev `run`
+    // has no hardened files on disk, and asserting that layout would only emit
+    // spurious "protected path missing" alerts — the posture self-check already
+    // reports the weak non-root deployment on its own.
+    if plugin_tamper::posture().is_root {
+        inject_tamper_defaults(&mut config);
+    }
+
     tracing::info!(agent_id = %config.agent_id, server = %args.server, "starting aegis-agent");
 
     let mut builder = HostBuilder::new(config).discover_static(true);
@@ -249,6 +271,44 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     tracing::info!("shutting down");
     running.shutdown().await?;
     Ok(())
+}
+
+/// Populate `plugin-tamper`'s `protected_paths` / `manifest_path` from the
+/// canonical hardened-install layout, without clobbering anything the operator
+/// already set in a `--config` TOML.
+///
+/// The installer ([`plugin_tamper::install::install`]) hashes and locks exactly
+/// the binary plus both unit files and writes the manifest to the state dir; the
+/// runtime tamper loop only watches the immutable bit and the existence of paths
+/// listed in `protected_paths`. Deriving both from the same [`InstallSpec`] the
+/// installer uses keeps the install-time and run-time views in lockstep, so the
+/// loop's immutable-bit and missing-file checks (and the startup immutability
+/// posture check) actually cover the deployed files.
+fn inject_tamper_defaults(config: &mut HostConfig) {
+    use plugin_tamper::install::InstallSpec;
+
+    let spec = InstallSpec::default();
+    let entry = config
+        .plugins
+        .entry("plugin-tamper".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(obj) = entry.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key("protected_paths") {
+        let paths: Vec<String> = spec
+            .protected_paths()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        obj.insert("protected_paths".to_string(), serde_json::json!(paths));
+    }
+    if !obj.contains_key("manifest_path") {
+        obj.insert(
+            "manifest_path".to_string(),
+            serde_json::Value::String(spec.manifest_path().display().to_string()),
+        );
+    }
 }
 
 /// Run an instrumented interactive shell: spawns `$SHELL` inside a PTY and emits
@@ -342,8 +402,8 @@ async fn enroll(args: EnrollArgs) -> anyhow::Result<()> {
     let tcp = TcpStream::connect((host.as_str(), port))
         .await
         .with_context(|| format!("connecting to {host}:{port}"))?;
-    let server_name =
-        ServerName::try_from(host.clone()).unwrap_or_else(|_| ServerName::try_from("server.aegis.local").unwrap());
+    let server_name = ServerName::try_from(host.clone())
+        .unwrap_or_else(|_| ServerName::try_from("server.aegis.local").unwrap());
     let mut tls = tls::connect(client_cfg, server_name, tcp)
         .await
         .context("TLS handshake failed (server cert pin mismatch?)")?;
@@ -429,5 +489,75 @@ fn os_descriptor() -> String {
         base.to_string()
     } else {
         format!("{base} {release}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plugin_tamper::install::InstallSpec;
+    use plugin_tamper::TamperConfig;
+
+    #[test]
+    fn inject_tamper_defaults_wires_the_install_layout() {
+        let mut config = HostConfig::new("agent-test");
+        inject_tamper_defaults(&mut config);
+
+        // The injected subtree must deserialize into the plugin's own config type
+        // and cover exactly the hardened-install paths (binary + both units) plus
+        // the standard manifest path the installer writes.
+        let subtree = config.plugin_config("plugin-tamper");
+        let cfg: TamperConfig = serde_json::from_value(subtree).expect("tamper subtree");
+        let spec = InstallSpec::default();
+        assert_eq!(cfg.protected_paths, spec.protected_paths());
+        assert_eq!(cfg.protected_paths.len(), 3);
+        assert_eq!(cfg.manifest_path, Some(spec.manifest_path()));
+    }
+
+    #[test]
+    fn inject_tamper_defaults_does_not_override_operator_config() {
+        // An operator who pins paths/manifest in a --config TOML must win.
+        let mut config = HostConfig::new("agent-test");
+        config.plugins.insert(
+            "plugin-tamper".to_string(),
+            serde_json::json!({
+                "protected_paths": ["/custom/agent"],
+                "manifest_path": "/custom/manifest.json",
+            }),
+        );
+        inject_tamper_defaults(&mut config);
+
+        let cfg: TamperConfig =
+            serde_json::from_value(config.plugin_config("plugin-tamper")).expect("tamper subtree");
+        assert_eq!(
+            cfg.protected_paths,
+            vec![std::path::PathBuf::from("/custom/agent")]
+        );
+        assert_eq!(
+            cfg.manifest_path,
+            Some(std::path::PathBuf::from("/custom/manifest.json"))
+        );
+    }
+
+    #[test]
+    fn inject_tamper_defaults_fills_only_missing_keys() {
+        // A partial operator config (paths only) still gets the manifest filled in.
+        let mut config = HostConfig::new("agent-test");
+        config.plugins.insert(
+            "plugin-tamper".to_string(),
+            serde_json::json!({ "protected_paths": ["/only/this"] }),
+        );
+        inject_tamper_defaults(&mut config);
+
+        let cfg: TamperConfig =
+            serde_json::from_value(config.plugin_config("plugin-tamper")).expect("tamper subtree");
+        assert_eq!(
+            cfg.protected_paths,
+            vec![std::path::PathBuf::from("/only/this")]
+        );
+        assert_eq!(
+            cfg.manifest_path,
+            Some(InstallSpec::default().manifest_path())
+        );
     }
 }

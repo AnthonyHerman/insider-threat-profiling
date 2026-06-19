@@ -149,7 +149,10 @@ pub async fn run(mut state: ActorState) {
                 }
                 let delay = backoff_delay(&state.cfg, backoff_exp);
                 backoff_exp = backoff_exp.saturating_add(1);
-                tracing::warn!(delay_ms = delay.as_millis() as u64, "transport: backing off");
+                tracing::warn!(
+                    delay_ms = delay.as_millis() as u64,
+                    "transport: backing off"
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     _ = state.shutdown.wait() => break,
@@ -166,7 +169,10 @@ pub async fn run(mut state: ActorState) {
             tracing::warn!(error = %e, count = leftover.len(),
                 "transport: failed to persist ring on shutdown");
         } else {
-            tracing::info!(count = leftover.len(), "transport: persisted ring to spill on shutdown");
+            tracing::info!(
+                count = leftover.len(),
+                "transport: persisted ring to spill on shutdown"
+            );
         }
     }
     tracing::info!("transport: actor stopped");
@@ -312,7 +318,12 @@ where
         agent_id: state.agent_id.clone(),
         hostname: hostname(),
         os: os_string(),
-        agent_pubkey: state.identity.signing_key.verifying_key().to_bytes().to_vec(),
+        agent_pubkey: state
+            .identity
+            .signing_key
+            .verifying_key()
+            .to_bytes()
+            .to_vec(),
     };
     send(wr, &hello)
         .await
@@ -736,7 +747,8 @@ where
                             let agent_id = agent_id.clone();
                             let emitter = emitter.clone();
                             tokio::spawn(async move {
-                                let result = dispatch_command(id, command, &agent_id, &emitter).await;
+                                let result =
+                                    dispatch_command(id, command, &agent_id, &emitter).await;
                                 if let Err(e) = send(&wr, &result).await {
                                     tracing::warn!(error = %e, "transport: command result send failed");
                                 }
@@ -751,7 +763,10 @@ where
                             });
                         }
                         other => {
-                            tracing::debug!(?other, "transport: ignoring unexpected inbound message");
+                            tracing::debug!(
+                                ?other,
+                                "transport: ignoring unexpected inbound message"
+                            );
                         }
                     }
                 }
@@ -838,10 +853,7 @@ async fn dispatch_command(
 /// Bound and strip control characters from server-supplied strings before they
 /// land in logs/alerts (defense against log injection / unbounded growth).
 fn sanitize(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control())
-        .take(256)
-        .collect()
+    s.chars().filter(|c| !c.is_control()).take(256).collect()
 }
 
 async fn send<W>(wr: &Arc<Mutex<W>>, msg: &Message) -> Result<(), aegis_proto::ProtoError>
@@ -952,12 +964,24 @@ mod tests {
 
     #[test]
     fn parse_server_variants() {
-        assert_eq!(parse_server("https://host:9000").unwrap(), ("host".into(), 9000));
+        assert_eq!(
+            parse_server("https://host:9000").unwrap(),
+            ("host".into(), 9000)
+        );
         assert_eq!(parse_server("host:1234").unwrap(), ("host".into(), 1234));
-        assert_eq!(parse_server("https://only-host").unwrap(), ("only-host".into(), 8443));
-        assert_eq!(parse_server("only-host").unwrap(), ("only-host".into(), 8443));
+        assert_eq!(
+            parse_server("https://only-host").unwrap(),
+            ("only-host".into(), 8443)
+        );
+        assert_eq!(
+            parse_server("only-host").unwrap(),
+            ("only-host".into(), 8443)
+        );
         // http:// is always rejected: the transport is TLS-only.
-        assert!(parse_server("http://h:443/").is_err(), "http:// must be rejected");
+        assert!(
+            parse_server("http://h:443/").is_err(),
+            "http:// must be rejected"
+        );
         assert!(parse_server("").is_err());
         assert!(parse_server("https://host:notaport").is_err());
     }
@@ -993,8 +1017,14 @@ mod tests {
             lo = lo.min(d);
             hi = hi.max(d);
         }
-        assert!(hi > 700, "expected some large draws near the ceiling, got hi={hi}");
-        assert!(lo < 300, "expected some small draws (full jitter), got lo={lo}");
+        assert!(
+            hi > 700,
+            "expected some large draws near the ceiling, got hi={hi}"
+        );
+        assert!(
+            lo < 300,
+            "expected some small draws (full jitter), got lo={lo}"
+        );
     }
 
     #[test]
@@ -1182,10 +1212,9 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (crd, cwr) = tokio::io::split(client_io);
         let spill_for_actor = spill.clone();
-        let actor =
-            tokio::spawn(
-                async move { serve_online(&state, &spill_for_actor, crd, Arc::new(Mutex::new(cwr))).await },
-            );
+        let actor = tokio::spawn(async move {
+            serve_online(&state, &spill_for_actor, crd, Arc::new(Mutex::new(cwr))).await
+        });
 
         let (mut srd, mut swr) = tokio::io::split(server_io);
         // First batch arrives.

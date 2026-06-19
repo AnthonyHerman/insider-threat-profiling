@@ -163,7 +163,8 @@ impl Spill {
         for row in table.iter()? {
             let (k, v) = row?;
             let bytes = v.value();
-            if !out.is_empty() && (out.len() >= max_events || acc + bytes.len() as u64 > max_bytes) {
+            if !out.is_empty() && (out.len() >= max_events || acc + bytes.len() as u64 > max_bytes)
+            {
                 break;
             }
             let event: Event = decode(bytes)?;
@@ -264,7 +265,11 @@ mod tests {
     }
 
     fn ev(uptime: u64) -> Event {
-        Event::new("agent-t", "test", EventPayload::Heartbeat { uptime_s: uptime })
+        Event::new(
+            "agent-t",
+            "test",
+            EventPayload::Heartbeat { uptime_s: uptime },
+        )
     }
 
     #[test]

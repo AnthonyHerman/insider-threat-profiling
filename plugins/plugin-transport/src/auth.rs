@@ -50,7 +50,10 @@ mod tests {
     fn nonce_is_deterministic_per_id() {
         let id = Uuid::new_v4();
         assert_eq!(nonce_from_challenge(&id), nonce_from_challenge(&id));
-        assert_ne!(nonce_from_challenge(&id), nonce_from_challenge(&Uuid::new_v4()));
+        assert_ne!(
+            nonce_from_challenge(&id),
+            nonce_from_challenge(&Uuid::new_v4())
+        );
     }
 
     #[test]

@@ -95,7 +95,9 @@ pub async fn connect<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    TlsConnector::from(config).connect(server_name, stream).await
+    TlsConnector::from(config)
+        .connect(server_name, stream)
+        .await
 }
 
 /// Construct the 32-byte digest the agent signs (and the server verifies) to
@@ -164,11 +166,20 @@ mod tests {
         // Each input must change the digest.
         let mut pin2 = pin;
         pin2[0] ^= 1;
-        assert_ne!(base, auth_challenge_digest(&pin2, "agent-1", &nonce, &exporter));
-        assert_ne!(base, auth_challenge_digest(&pin, "agent-2", &nonce, &exporter));
+        assert_ne!(
+            base,
+            auth_challenge_digest(&pin2, "agent-1", &nonce, &exporter)
+        );
+        assert_ne!(
+            base,
+            auth_challenge_digest(&pin, "agent-2", &nonce, &exporter)
+        );
         let mut nonce2 = nonce;
         nonce2[0] ^= 1;
-        assert_ne!(base, auth_challenge_digest(&pin, "agent-1", &nonce2, &exporter));
+        assert_ne!(
+            base,
+            auth_challenge_digest(&pin, "agent-1", &nonce2, &exporter)
+        );
         assert_ne!(
             base,
             auth_challenge_digest(&pin, "agent-1", &nonce, &[2u8; 32])

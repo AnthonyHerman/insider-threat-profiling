@@ -497,6 +497,9 @@ mod tests {
                 }
             }
         }
-        assert!(any_detection, "expected at least one human Detection emitted");
+        assert!(
+            any_detection,
+            "expected at least one human Detection emitted"
+        );
     }
 }

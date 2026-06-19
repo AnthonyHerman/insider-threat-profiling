@@ -581,10 +581,26 @@ mod tests {
         let fv: FeatureVector = serde_json::from_str(json).expect("deserialize");
         // The three Tier-3 temporal features that previously defaulted to 0.0
         // (strong agent evidence) must now default to NaN (no evidence).
-        assert!(fv.gap_autocorr.is_nan(), "gap_autocorr should be NaN, got {}", fv.gap_autocorr);
-        assert!(fv.think_tail_ratio.is_nan(), "think_tail_ratio should be NaN, got {}", fv.think_tail_ratio);
-        assert!(fv.throughput_decay.is_nan(), "throughput_decay should be NaN, got {}", fv.throughput_decay);
-        assert!(fv.keystroke_burst_cv.is_nan(), "keystroke_burst_cv should be NaN, got {}", fv.keystroke_burst_cv);
+        assert!(
+            fv.gap_autocorr.is_nan(),
+            "gap_autocorr should be NaN, got {}",
+            fv.gap_autocorr
+        );
+        assert!(
+            fv.think_tail_ratio.is_nan(),
+            "think_tail_ratio should be NaN, got {}",
+            fv.think_tail_ratio
+        );
+        assert!(
+            fv.throughput_decay.is_nan(),
+            "throughput_decay should be NaN, got {}",
+            fv.throughput_decay
+        );
+        assert!(
+            fv.keystroke_burst_cv.is_nan(),
+            "keystroke_burst_cv should be NaN, got {}",
+            fv.keystroke_burst_cv
+        );
         // Fields that are safe at 0.0 still default to 0.0 (no-hit / no-paste).
         assert_eq!(fv.reaction_floor_hits, 0.0);
         assert_eq!(fv.whole_line_paste_ratio, 0.0);
