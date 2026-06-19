@@ -167,7 +167,37 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     tracing::info!(http = %args.http, "HTTP API/dashboard listening");
 
     tracing::info!("aegisd running; press Ctrl-C to stop");
-    tokio::signal::ctrl_c().await?;
+    // While running, periodically surface bus-loss counters so event loss is
+    // observable (the counters exist precisely so loss is "alertable rather than
+    // merely a log line"). Logged as a delta against the last sweep to avoid spam;
+    // the loop ends as soon as Ctrl-C fires, after which we shut down.
+    {
+        let metrics = running.bus_metrics();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.tick().await; // consume the immediate first tick
+        let mut last_ingress = metrics.ingress_dropped();
+        let mut last_fanout = metrics.fanout_dropped();
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = ticker.tick() => {
+                    let ingress = metrics.ingress_dropped();
+                    let fanout = metrics.fanout_dropped();
+                    if ingress > last_ingress || fanout > last_fanout {
+                        tracing::warn!(
+                            ingress_dropped = ingress,
+                            fanout_dropped = fanout,
+                            ingress_delta = ingress - last_ingress,
+                            fanout_delta = fanout - last_fanout,
+                            "aegisd: bus dropped events since last report"
+                        );
+                        last_ingress = ingress;
+                        last_fanout = fanout;
+                    }
+                }
+            }
+        }
+    }
     tracing::info!("shutting down aegisd");
 
     // Stop the network ingress (TLS ingest) and the HTTP server first so no new

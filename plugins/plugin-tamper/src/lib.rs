@@ -30,6 +30,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::{watch, Mutex};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -135,8 +137,22 @@ pub fn systemd_present() -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Default)]
-pub struct TamperPlugin;
+pub struct TamperPlugin {
+    /// Stop signal for the background tasks (watch loop + signal tripwire); fired
+    /// by [`Plugin::shutdown`] so neither task outlives the host.
+    stop: watch::Sender<bool>,
+    /// Handles of the spawned background tasks, awaited on shutdown.
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Default for TamperPlugin {
+    fn default() -> Self {
+        TamperPlugin {
+            stop: watch::channel(false).0,
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+}
 
 #[async_trait]
 impl Plugin for TamperPlugin {
@@ -197,7 +213,10 @@ impl Plugin for TamperPlugin {
         // SIGTERM/SIGINT tripwire: report disappearance even if a guardian revives
         // us quickly. A cross-UID signal from the monitored user is denied by the
         // kernel, so this fires for legitimate/root stops and acts as a tripwire.
-        spawn_signal_tripwire(emitter.clone(), agent_id.clone());
+        // It also honours `shutdown` so a clean host stop does not race its
+        // `process::exit(0)` against the host's own teardown.
+        let tripwire =
+            spawn_signal_tripwire(emitter.clone(), agent_id.clone(), self.stop.subscribe());
 
         // Load the baseline manifest once (root-owned). Content drift is checked
         // against it each tick; paths not covered fall back to an existence check.
@@ -211,11 +230,22 @@ impl Plugin for TamperPlugin {
         }
 
         let started = std::time::Instant::now();
-        tokio::spawn(async move {
+        let mut stop = self.stop.subscribe();
+        let watch_loop = tokio::spawn(async move {
             let mut ticker =
                 tokio::time::interval(Duration::from_secs(cfg.check_interval_s.max(1)));
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    // Cooperative shutdown: stop so the task (and its emitter Arc)
+                    // does not outlive the host.
+                    res = stop.changed() => {
+                        if res.is_err() || *stop.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
 
                 // 1. Content integrity against the baseline manifest (catches an
                 //    in-place replacement that a bare existence check misses).
@@ -278,6 +308,26 @@ impl Plugin for TamperPlugin {
                     .await;
             }
         });
+
+        // Retain the task handles so `shutdown` can stop and join them.
+        let mut handles = self.handles.lock().await;
+        handles.push(watch_loop);
+        if let Some(tripwire) = tripwire {
+            handles.push(tripwire);
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        // Signal both background tasks to stop, then await them so neither (and
+        // the `Arc<dyn Emitter>` each holds) outlives the host. In particular the
+        // signal tripwire stops waiting on SIGTERM/SIGINT, so its `process::exit`
+        // can no longer fire after a clean host shutdown.
+        let _ = self.stop.send(true);
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.handles.lock().await);
+        for handle in handles {
+            let _ = handle.await;
+        }
         Ok(())
     }
 }
@@ -308,10 +358,19 @@ async fn emit_tamper(
 ///
 /// Linux-only (the agent's target). The alert is awaited before exiting so it has
 /// a chance to reach the bus; `process::exit(0)` then ends the process cleanly.
+///
+/// Honours `stop` (fired by [`Plugin::shutdown`]): on a clean host shutdown the
+/// task exits *without* calling `process::exit`, so a graceful teardown is not
+/// turned into an abrupt exit and the task does not linger holding the emitter.
+/// Returns the [`JoinHandle`] so the plugin can await it on shutdown.
 #[cfg(unix)]
-fn spawn_signal_tripwire(emitter: std::sync::Arc<dyn aegis_sdk::Emitter>, agent_id: String) {
+fn spawn_signal_tripwire(
+    emitter: std::sync::Arc<dyn aegis_sdk::Emitter>,
+    agent_id: String,
+    mut stop: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
     use tokio::signal::unix::{signal, SignalKind};
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let (mut term, mut intr) = match (
             signal(SignalKind::terminate()),
             signal(SignalKind::interrupt()),
@@ -325,6 +384,10 @@ fn spawn_signal_tripwire(emitter: std::sync::Arc<dyn aegis_sdk::Emitter>, agent_
         let which = tokio::select! {
             _ = term.recv() => "SIGTERM",
             _ = intr.recv() => "SIGINT",
+            // Clean shutdown from the host: leave quietly, do not exit the process
+            // (the sender only ever sends `true`, and a dropped sender also means
+            // the host is gone — both cases just end the task).
+            _ = stop.changed() => return,
         };
         emit_tamper(
             &emitter,
@@ -336,13 +399,19 @@ fn spawn_signal_tripwire(emitter: std::sync::Arc<dyn aegis_sdk::Emitter>, agent_
         // Best-effort flush window for async emitters/forwarders, then exit.
         tokio::time::sleep(Duration::from_millis(200)).await;
         std::process::exit(0);
-    });
+    }))
 }
 
 #[cfg(not(unix))]
-fn spawn_signal_tripwire(_emitter: std::sync::Arc<dyn aegis_sdk::Emitter>, _agent_id: String) {}
+fn spawn_signal_tripwire(
+    _emitter: std::sync::Arc<dyn aegis_sdk::Emitter>,
+    _agent_id: String,
+    _stop: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    None
+}
 
-register_plugin!("plugin-tamper", || Box::new(TamperPlugin));
+register_plugin!("plugin-tamper", || Box::new(TamperPlugin::default()));
 
 #[cfg(test)]
 mod tests {

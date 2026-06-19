@@ -74,18 +74,24 @@ fn hash_reader<R: io::Read>(reader: &mut R) -> io::Result<String> {
 }
 
 impl Manifest {
-    /// Build a manifest by reading and hashing each path (install time).
+    /// Build a manifest by hashing each path (install time).
     ///
-    /// Returns the first read error encountered, so a manifest is never written
-    /// over a file the installer could not read.
+    /// Each file is streamed through [`hash_reader`] in fixed-size chunks rather
+    /// than slurped whole with `std::fs::read`: the protected set includes the
+    /// agent binary, which can be tens or hundreds of MB, so buffering it entirely
+    /// would cause a transient allocation spike at install. `len` comes from the
+    /// open file's metadata. Returns the first I/O error encountered, so a manifest
+    /// is never written over a file the installer could not read.
     pub fn from_paths(paths: &[PathBuf]) -> io::Result<Self> {
         let mut entries = Vec::with_capacity(paths.len());
         for path in paths {
-            let bytes = std::fs::read(path)?;
+            let mut file = std::fs::File::open(path)?;
+            let len = file.metadata()?.len();
+            let sha256 = hash_reader(&mut file)?;
             entries.push(ManifestEntry {
                 path: path.clone(),
-                sha256: hash_bytes(&bytes),
-                len: bytes.len() as u64,
+                sha256,
+                len,
             });
         }
         Ok(Manifest {

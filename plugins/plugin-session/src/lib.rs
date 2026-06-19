@@ -113,19 +113,37 @@ pub fn command_stats(command: &str, salt: &str) -> CommandStats {
     }
 }
 
-/// Shannon entropy in bits per character over the byte distribution.
+/// Shannon entropy in bits per character, over the distribution of Unicode
+/// scalar values (`char`s) in `s`.
+///
+/// Counted per-`char` (not per-byte) so the unit matches `command_len`
+/// ([`CommandStats`] counts `chars`), the `bits/char` contract on
+/// [`EventPayload::CommandObserved`](aegis_sdk::EventPayload::CommandObserved),
+/// and the model's `dense-commands` term, which centres the transfer at 4.2
+/// bits/char. For pure-ASCII input byte- and char-entropy coincide; for
+/// multibyte UTF-8 they diverge, and the per-char measure is the one every
+/// consumer assumes.
 pub fn shannon_entropy(s: &str) -> f64 {
-    if s.is_empty() {
+    let mut counts: std::collections::HashMap<char, u32> = std::collections::HashMap::new();
+    let mut n: u64 = 0;
+    for c in s.chars() {
+        *counts.entry(c).or_insert(0) += 1;
+        n += 1;
+    }
+    if n == 0 {
         return 0.0;
     }
-    let mut counts = [0u32; 256];
-    for &b in s.as_bytes() {
-        counts[b as usize] += 1;
-    }
-    let n = s.len() as f64;
+    let n = n as f64;
+    // Sum in a deterministic order. `HashMap` iteration order is randomized per
+    // map, and floating-point addition is not associative, so summing the
+    // per-symbol terms in iteration order makes the result vary by a few ULPs
+    // between calls on identical input. Entropy depends only on the multiset of
+    // counts, so sorting the counts yields a canonical, reproducible order
+    // (which `command_stats`' `PartialEq` and its callers rely on).
+    let mut counts: Vec<u32> = counts.into_values().collect();
+    counts.sort_unstable();
     counts
         .iter()
-        .filter(|&&c| c > 0)
         .map(|&c| {
             let p = c as f64 / n;
             -p * p.log2()
@@ -144,6 +162,23 @@ mod tests {
         assert!(shannon_entropy("aaaaaaaa") < 0.01);
         let h = shannon_entropy("abcdefghijklmnop");
         assert!(h > 3.9, "entropy was {h}");
+    }
+
+    /// Entropy is measured per *character*, not per byte: four distinct chars,
+    /// each appearing once, must give exactly log2(4) = 2 bits/char regardless of
+    /// how many UTF-8 bytes those chars occupy. (A per-byte measure over the same
+    /// multibyte string would report a different value — the bug this guards.)
+    #[test]
+    fn entropy_is_per_char_not_per_byte() {
+        // Four distinct multibyte chars, equiprobable -> 2.0 bits/char exactly.
+        let s = "αβγδ"; // each is 2 bytes in UTF-8 (8 bytes, 4 chars)
+        assert_eq!(s.len(), 8);
+        assert_eq!(s.chars().count(), 4);
+        let h = shannon_entropy(s);
+        assert!((h - 2.0).abs() < 1e-12, "per-char entropy was {h}");
+
+        // A single repeated multibyte char has zero entropy (one symbol).
+        assert!(shannon_entropy("日日日") < 1e-12);
     }
 
     #[test]

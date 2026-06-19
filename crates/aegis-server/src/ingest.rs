@@ -281,6 +281,12 @@ pub fn load_or_create_server_cert(
 
 /// Write `bytes` to `path` atomically (temp file in the same dir + `rename`) with
 /// the given Unix `mode`, applied to the temp file *before* the rename.
+///
+/// If any step before the rename fails (open, `write_all`, `flush`, `sync_all`),
+/// a [`TmpGuard`] removes the side-car temp file on the way out, so repeated
+/// failures (e.g. a full disk that permits `open` but not `write`) cannot litter
+/// the directory with orphaned `.tmp` files. The guard is defused only once the
+/// rename succeeds.
 fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -289,6 +295,30 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
         path.file_name().and_then(|n| n.to_str()).unwrap_or("out"),
         std::process::id()
     ));
+
+    /// RAII cleanup for the temp file: removes it on drop unless `defuse()` ran
+    /// (after a successful rename, when the temp path no longer exists).
+    struct TmpGuard<'a> {
+        path: &'a Path,
+        armed: bool,
+    }
+    impl TmpGuard<'_> {
+        fn defuse(&mut self) {
+            self.armed = false;
+        }
+    }
+    impl Drop for TmpGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = std::fs::remove_file(self.path);
+            }
+        }
+    }
+    let mut guard = TmpGuard {
+        path: &tmp,
+        armed: true,
+    };
+
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -302,7 +332,10 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
         f.flush()?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // Renamed into place: the temp path is gone, so disarm the cleanup.
+    guard.defuse();
+    Ok(())
 }
 
 // --- Accept loop ----------------------------------------------------------
@@ -888,6 +921,32 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "temp file must be renamed away");
+    }
+
+    /// L?-regression: when the final `rename` fails, `write_atomic` must not leave
+    /// an orphaned `.tmp` side-car behind (the RAII cleanup guard removes it). We
+    /// force the rename to fail by making the *target* an existing directory.
+    #[test]
+    fn write_atomic_cleans_up_temp_on_failure() {
+        let dir = TempDir::new().unwrap();
+        // A directory at the target path: open/write/sync of the temp succeed, but
+        // renaming a file onto a directory fails.
+        let target = dir.path().join("occupied");
+        std::fs::create_dir(&target).unwrap();
+
+        let err = write_atomic(&target, b"payload", 0o600);
+        assert!(err.is_err(), "rename onto a directory must fail");
+
+        // The side-car temp file must have been cleaned up by the guard.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file must be removed when write_atomic fails: {leftovers:?}"
+        );
     }
 
     /// The dedup set is keyed by Event.id: the same id twice is one accept.

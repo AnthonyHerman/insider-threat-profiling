@@ -76,7 +76,9 @@ no features: telemetry collection, detection, scoring, transport, and tamper
 resistance are all independently deployable plugins sharing a single typed event
 bus. Second, a content-free agent-vs-human detector that classifies sessions from
 timing and structural statistics alone — never keystroke content — using a
-transparent additive model with six interpretable features. Third, a
+transparent additive model over interpretable features organized in two tiers:
+six cheap-to-fake Tier-1 marginals and a set of costlier-to-fake Tier-2/3
+joint-structure terms. Third, a
 game-theoretic analysis of detection-vs-evasion as a Stackelberg signaling game
 and of tamper-resistance as a war of attrition, yielding concrete design rules for
 both. Fourth, ethical tamper resistance implemented exclusively via supported OS
@@ -164,22 +166,28 @@ a paste/burst flag, and burst length; `EventPayload::CommandObserved` carries
 length, token count, Shannon entropy, a backspace flag, edit distance from the
 previous command, inter-command timing, and a salted hash for correlation —
 never verbatim text. From these content-free features `plugin-agent-detect`
-constructs six behavioral signals (keystroke timing coefficient of variation,
-paste ratio, mean inter-command think time, backspace ratio, command entropy mean,
-and cadence regularity) and combines them in a transparent additive model whose
-every verdict is attributable to named features and reported reasons. The model is
-designed to be swappable: the `Model::assess` interface is stable and a learned
-model can replace the hand-calibrated logistic terms without changing the pipeline.
+constructs six Tier-1 behavioral marginals (keystroke timing coefficient of
+variation, paste ratio, mean inter-command think time, backspace ratio, command
+entropy mean, and cadence regularity) and a set of costlier-to-fake Tier-2/3
+joint-structure terms (gap autocorrelation, think-time tail ratio, throughput
+decay, whole-line-injection ratio, within-burst timing variability, and a
+reaction-time-floor counter), and combines them in a transparent additive model
+whose every verdict is attributable to named features and reported reasons. The
+model is designed to be swappable: the `Model::assess` interface is stable and a
+learned model can replace the hand-calibrated logistic terms without changing the
+pipeline.
 
 **Game-theoretic evasion analysis.** We analyze detection as a Stackelberg
 signaling game in which the defender commits to the model first and the automated
-agent best-responds by choosing an evasion-effort vector over the six feature
+agent best-responds by choosing an evasion-effort vector over the feature
 dimensions. Because the codebase is open-source, the follower observes every
 logistic center, slope, and weight exactly. We independently compute payoffs from
-`model.rs` and show that the cheapest evasion strategy — the dead-band camp at
-`p_agent` between the `Uncertain` thresholds — achieves zero risk accumulation at
-near-zero effort, and that the timing features, despite carrying the highest model
-weight, are defeatable by `sleep()` calls alone. The equilibrium analysis
+`model.rs` against the original six Tier-1 dimensions and show that the cheapest
+evasion strategy — the dead-band camp at `p_agent` between the `Uncertain`
+thresholds — achieves zero risk accumulation at near-zero effort, and that in that
+original weighting the timing features, despite carrying the highest model weight,
+are defeatable by `sleep()` calls alone; the live model demotes those Tier-1 terms
+and promotes the Tier-2/3 joint-structure terms precisely to raise this cost. The equilibrium analysis
 identifies that parameter tuning cannot escape the problem; only changes to the
 strategy space (kernel-anchored eBPF/HID signals, server-side classification,
 actionable `Uncertain`) shift the equilibrium. We apply the same game-theoretic
@@ -218,9 +226,10 @@ the game-theoretic analysis of both the detection game and the tamper-resistance
 game. Section 7 evaluates the system on synthetic sessions, reporting detection
 performance versus evasion budget and the tamper-resistance layered-cost argument.
 Section 8 covers implementation. Section 9 discusses limitations, including the
-synthetic evaluation, the open hardening and transport *assurance* gaps (the
-mechanisms are built; closing the audit findings and defaulting to a root install
-remain), and the path to field validation. Section 10 concludes.
+synthetic evaluation, the remaining hardening and transport *assurance* gaps (the
+mechanisms are built and most audit findings are now closed; closing the last
+loader finding and defaulting to a root install remain), and the path to field
+validation. Section 10 concludes.
 
 ---
 
@@ -764,7 +773,7 @@ made automation worthwhile.
 
 Aegis protects eight assets; the overarching one is **A1 — endpoint visibility**: the agent must remain alive, root-owned, and emitting telemetry. Every tamper-resistance mechanism exists to prevent an unprivileged monitored user from silently extinguishing that visibility, mirroring the posture of commercial EDR/DLP tools [karantzas2021edr]. The remaining assets follow in dependency order: **A2** (detection integrity — verdicts reflect reality), **A3** (telemetry integrity — events are genuine and unmodified), **A4** (scoring and alerting fidelity), **A5** (subject privacy — telemetry is content-free, commands are summarized as salted SHA-256 hashes rather than captured text), **A6** (server availability), **A7** (host-process integrity against malicious plugin code), and **A8** — the deliberate backdoor — the guarantee that an authenticated root administrator can always uninstall cleanly.
 
-Five trust boundaries partition the system. **TB1** (unprivileged user vs. the root-owned agent process) is the primary enforcement surface: crossing it requires becoming root. **TB2** is the process boundary guarded against ptrace and `LD_PRELOAD`. **TB3** is the event bus inside `aegis-core`: each plugin emits through a per-plugin `ScopedEmitter` that overwrites `event.source` with the plugin's registered name and pins `agent_id` to the host identity, so source/identity *attribution* is trustworthy on the in-process bus, but there is no payload-kind ACL there — any in-process plugin can still emit a `Detection`/`Alert`/`Score` payload, so a malicious plugin remains a forgery surface (the kind allowlist is enforced only on the server ingest path). **TB4** is the network path between agent and server, protected by mTLS with certificate pinning and an Ed25519 challenge-response bound to a fresh server nonce; the residual gap is the absence of a per-message sequence number, leaving cross-session replay unprevented (audit L3/L4). **TB5** is the plugin supply-chain boundary: dynamic `.so` files are loaded via an `unsafe` `dlopen` call with only an integer ABI version check, so the `.so` constructor executes before any integrity verification.
+Five trust boundaries partition the system. **TB1** (unprivileged user vs. the root-owned agent process) is the primary enforcement surface: crossing it requires becoming root. **TB2** is the process boundary guarded against ptrace and `LD_PRELOAD`. **TB3** is the event bus inside `aegis-core`: each plugin emits through a per-plugin `ScopedEmitter` that overwrites `event.source` with the plugin's registered name and pins `agent_id` to the host identity, so source/identity *attribution* is trustworthy on the in-process bus, but there is no payload-kind ACL there — any in-process plugin can still emit a `Detection`/`Alert`/`Score` payload, so a malicious plugin remains a forgery surface (the kind allowlist is enforced only on the server ingest path). **TB4** is the network path between agent and server, protected by mTLS with certificate pinning and an Ed25519 challenge-response bound to a fresh server nonce; the original cross-session replay gap (audit L3/L4) is now closed by a bounded cross-connection dedup window with true FIFO eviction, though the protocol still carries no per-message sequence number, so replay resistance rests on the dedup window rather than on a monotonic counter. **TB5** is the plugin supply-chain boundary: dynamic `.so` files are loaded via an `unsafe` `dlopen` call with only an integer ABI version check, so the `.so` constructor executes before any integrity verification.
 
 ### 4.2 Adversary Model
 
@@ -810,7 +819,7 @@ The **tamper-resistance Mermaid figure** (in `docs/diagrams.md`) illustrates the
 
 The decisive structural fact is that the layers are **conjunctive, not additive**. Persistent removal requires clearing every layer, and every layer's clearing cost is "become root." With L1 and L4 both holding: a plain `SIGKILL` is denied (cross-UID kill fails), `LD_PRELOAD` from the user UID is silently ignored by a root process, `ptrace` attach is denied by the UID mismatch, and deleting or overwriting the binary first requires clearing the immutable bit. With L3 holding: even a successful transient kill is immediately reversed.
 
-**Implementation status and residual gap.** The hardening lifecycle is implemented, not stubbed: `Command::Install` (`aegis-agent`) copies the binary root-owned, renders and `enable --now`s the service and guardian units, writes a SHA-256 baseline manifest, and sets the immutable bit on the binary, units, and manifest (`plugin_tamper::install::install`); `Command::Guard` runs a real liveness watchdog (`install::guard`); and the tamper-watch loop verifies content against the baseline manifest (`manifest::verify`) and watches the immutable bit each tick, so an in-place binary replacement is caught by the hash check rather than passing a bare existence test. When the installer is actually run as root, layers L1–L6 hold and the subgame-perfect equilibrium is the intended one: every persistent-removal path is gated on `CAP_LINUX_IMMUTABLE` plus cross-UID authority that ADV-U lacks. The residual gap is one of *deployment and assurance* rather than missing mechanism: an agent left running unprivileged (the posture self-check reports this as a `Critical` alert but does not fail closed) lacks L1/L4, and the security audit (Section 8) documents open installer-hardening findings — notably a destination symlink-follow in the root-run install path — that must be closed before the posture can be trusted in production. The tamper loop also deliberately does *not* auto-re-arm (clearing the immutable bit already requires root, and re-arming would race the legitimate root uninstall), so a transient-root attacker is detected but not actively reverted.
+**Implementation status and residual gap.** The hardening lifecycle is implemented, not stubbed: `Command::Install` (`aegis-agent`) copies the binary root-owned, renders and `enable --now`s the service and guardian units, writes a SHA-256 baseline manifest, and sets the immutable bit on the binary, units, and manifest (`plugin_tamper::install::install`); `Command::Guard` runs a real liveness watchdog (`install::guard`); and the tamper-watch loop verifies content against the baseline manifest (`manifest::verify`) and watches the immutable bit each tick, so an in-place binary replacement is caught by the hash check rather than passing a bare existence test. When the installer is actually run as root, layers L1–L6 hold and the subgame-perfect equilibrium is the intended one: every persistent-removal path is gated on `CAP_LINUX_IMMUTABLE` plus cross-UID authority that ADV-U lacks. The residual gap is one of *deployment and assurance* rather than missing mechanism: an agent left running unprivileged (the posture self-check reports this as a `Critical` alert but does not fail closed) lacks L1/L4. The installer-hardening findings the security audit raised against the root-run install path — notably a destination symlink-follow — have since been closed (the install path now writes through `O_NOFOLLOW` descriptors and sets ownership via `fchown` on the verified fd), so what remains before the posture can be trusted in production is defaulting deployments to a root install with a fail-loud weak-posture check rather than any missing installer mechanism. The tamper loop also deliberately does *not* auto-re-arm (clearing the immutable bit already requires root, and re-arming would race the legitimate root uninstall), so a transient-root attacker is detected but not actively reverted.
 
 The **transient-gap sub-game** deserves separate treatment. Even with a working guardian at `RestartSec=1s`, a sub-second kill loop achieves a blind fraction approaching 1.0. At `RestartSec=0.1s` the blind fraction drops to roughly 0.10, but a sustained loop trips `StartLimitBurst`, converting a stealthy recurring gap into a repeated-restart signal — provided L6 exists to report it.
 
@@ -889,6 +898,12 @@ Third, the abstentions in the mid-budget range are not wasted signal. The deploy
 
 The central caveat must be stated plainly: **these results are synthetic, not field-validated**. Sessions are sampled from documented behavioural distributions, not collected from instrumented humans and agents operating real endpoints. The evaluation rigorously establishes that the production feature pipeline and transparent model separate the *modelled* behaviours, and it quantifies the evasion trade-off under those models — but the absolute AUC, accuracy, and per-budget figures are properties of the generator's distributions, and real human and agent behaviour will differ in ways the generator does not capture. In particular, the evasion budget is an idealised knob: it assumes an adversary can smoothly interpolate toward the human marginal, including hard-to-imitate properties like think-time autocorrelation and fatigue, which a real evader may approximate only crudely or, conversely, defeat in ways we have not modelled. Sim and Janakiraman's caution that content-free timing carries less information than content-aware features [sim2007digraphs] applies directly here, since Aegis deliberately discards content. The synthetic separation should therefore be read as necessary evidence that the mechanism is sound and the evasion economics are as claimed — not as a measured field detection rate. A field study with IRB-approved, consent-scoped data collection, and ground truth from instrumentation such as eBPF/HID capture, is required to estimate real-world accuracy and is left to future work.
 
+### Live deployment
+
+The synthetic evaluation above exercises the detection *model*; it does not exercise the deployed *system*. To validate the full pipeline across real process and network boundaries, we ran an end-to-end test on a Linux host distinct from the build machine — a Linode VM (Ubuntu 24.04, x86-64, 1 vCPU, glibc 2.39) — driven by `scripts/integration_demo.sh`, with release binaries copied over and no Rust toolchain on the host. The test validated, in sequence: a single self-contained `aegisd` binary starting with no external database, asset directory, or runtime dependencies (it created its embedded `redb` store, generated a self-signed TLS certificate, and bound both the TLS ingest listener and the dashboard); a one-time-token enrollment over pinned mutual TLS in which the agent generated an Ed25519 key, enrolled, and persisted a server-assigned identity; batched telemetry forwarding from the agent's collectors and `plugin-transport` forwarder, validated and ingested server-side (a sample run accepted 153 of 154 events, rejecting one as a malformed-frame guard); and, the flagship, central agent-vs-human detection on *forwarded* telemetry. Synthetic agent-like input (metronomic, paste-like, no corrections; supplied via `plugin-tty` pipe mode) was forwarded to the server, whose central `plugin-agent-detect` produced, visible through the operator API, a verdict of **`agent` at confidence 0.855** (model `transparent-additive/v1`, reasons `uncorrelated-flat-throughput`, `gap-non-autocorrelation`, `whole-line-injection`, `constant-think-time`), and the scoring chain produced risk scores and a `critical` alert. This confirms the architecture's central claim operationally: the network transport is just another event producer, and the same feature-free kernel reaches a detection verdict on telemetry that originated on a separate host and crossed a real mTLS link.
+
+Live integration testing also surfaced two genuine defects that the in-process tests had missed — an honest engineering lesson worth recording, because the prior unit and integration tests drive the pipeline over the in-process event bus and therefore never exercised the real *enroll → authenticated session → forward* path. First, the forwarder authenticated its telemetry session with the wrong identity: it sent the local host-config `agent_id` in its `ClientHello` rather than the server-assigned enrollment UUID, so every session was rejected as an unknown agent and the agent enrolled but then silently never reported (fixed by authenticating as `identity.agent_id`). Second, pipe-mode telemetry was dropped by the unknown-session guard: the H3 hardening drops keystroke and command events for any session lacking a prior `SessionStart`, and `plugin-tty`'s pipe mode emitted `SessionEnd` but not `SessionStart`, relying on a `session_id` from `plugin-session`'s login event that coincided on the dev box but differed under the remote SSH environment — so the session telemetry was discarded and no detection fired (fixed by having pipe mode emit its own `SessionStart`). Both defects are artifacts of crossing real process and network boundaries, invisible to an in-process harness; both are now covered by `scripts/integration_demo.sh`, which reproduces the full network path and polls for the verdict. The lesson is general: for a client/server security tool, in-process tests validate logic but not deployment, and a real-hardware end-to-end pass is necessary to catch identity, session, and framing defects that only appear once events actually traverse the wire.
+
 ---
 
 ## Implementation & Assurance
@@ -947,6 +962,44 @@ means the exact dependency tree recorded in `Cargo.lock` is what is built, and
 any uncommitted change to a transitive dependency causes a build failure rather
 than a silent drift. This is a lightweight but meaningful supply-chain hygiene
 measure for a security product [aucsmith1996tamper].
+
+### Hot-Path Performance (Indicative)
+
+We benchmarked the performance-sensitive paths with `criterion` micro-benchmarks
+to confirm that detection is not the throughput ceiling. These figures should be
+read as **indicative, not authoritative**: they were measured on a developer
+laptop (Intel Core i7-1165G7, Linux 6.18, `bench` profile) that was not quiesced —
+background load, frequency scaling, and hyperthreading were all enabled, and the
+criterion sampling was reduced for turnaround — so run-to-run variation is
+commonly ±5–15% and a number is meaningful only to roughly one significant
+figure. They establish orders of magnitude and the *shape* of each cost, not
+reproducible absolutes, and the full methodology and tables are in `docs/perf.md`.
+
+Scoring a feature vector through the transparent additive model (`Model::assess`)
+costs a few hundred nanoseconds per verdict (median ~352 ns on a clear-human
+vector, ~533 ns on the slowest agent path where the hard rules fire and the
+reasons list is assembled). The dominant per-tick CPU cost is feature extraction
+(`SessionAccumulator::features`), which runs ~3.7 µs on a typical human session
+but scales steeply with session length — from ~3.1 µs at 16 commands to ~92 µs
+near the `SAMPLE_CAP` of 2048 gap samples — because two `percentile` calls each
+sort a clone of the bounded sample window; this cost is precisely why
+`SAMPLE_CAP` exists, and in production `features()` runs once per `assess_every`
+events rather than per event. The agent→server JSON wire codec encodes and
+decodes `EventBatch` frames at ~100 MiB/s and scales linearly with batch size
+(~3.3 µs per mixed ~400-byte event in the serialization round-trip; the real
+`write_message`/`read_message` path over a duplex adds a modest fixed overhead),
+quantifying the cost of the deliberate self-describing-JSON protocol choice. The
+kernel event bus sustains roughly 0.6 M events/second in its two-worker
+configuration (single-event round-trip latency ~12 µs, amortizing to ~1.6 µs per
+event under load), and the end-to-end detector path — a full synthetic session of
+several hundred telemetry events through `AgentDetectPlugin::handle` — completes
+in a few hundred microseconds (~265–297 µs whole-session, well under 1 µs per
+event). The robust takeaways are that scoring is effectively free relative to one
+bus hop, that feature extraction is the dominant detection cost and is bounded by
+`SAMPLE_CAP`, and that the kernel's task-handoff — not the detection math — is the
+throughput ceiling for the in-process pipeline. These are isolated-function
+microbenchmarks: they deliberately do not capture server-side socket I/O, TLS, or
+disk-backed persistence, and so are not a system-throughput claim.
 
 ### Continuous Integration
 
@@ -1007,18 +1060,27 @@ requiring non-default invocation), and one low finding was upgraded to medium
 operator-facing pagination API). No finding in the final report is a false
 positive.
 
-The audit confirmed 28 findings: 7 high, 10 medium, and 11 low. The most
-structurally significant concern is the dynamic plugin loader (findings H5–H7):
-`.so` plugins are currently `dlopen`ed with no integrity, signature, or ownership
-verification, and a disabled plugin's constructor still executes before the
-enable check runs — an arbitrary native-code-execution surface inside the very
-component meant to detect an insider. Additional high-severity findings document
-that short-session `NaN` feature values silently drop Detection events from the
-audit log (H4), that the spill-to-disk buffer never enforces its configured size
-cap on the main enrolled path (H1), and that the spill database is created
-world-readable while the agent's own key material is locked to 0600 (H2). The
-full findings table, per-finding rationale, and a prioritized remediation backlog
-are in `docs/security-audit.md`.
+The audit confirmed 28 findings: 7 high, 10 medium, and 11 low. The findings have
+since been remediated and the status re-verified against source: **26 of the 28
+are now fixed in code**, leaving a single substantive open item — H5 — plus L7,
+which was a documentation action and is now satisfied. The most structurally
+significant concern, and the one still open, is the dynamic plugin loader: H5
+(`.so` plugins are `dlopen`ed with no integrity, signature, or ownership
+verification) remains genuinely unimplemented — an arbitrary native-code-execution
+surface inside the very component meant to detect an insider — even though the
+*related* loader-hardening findings around it have been closed (H6, the disabled
+plugin whose constructor ran before the enable check, is fixed by checking
+`is_enabled` before `dlopen`; H7, the cross-allocator `Box::from_raw`, is fixed by
+a paired free symbol; and a `catch_unwind` now isolates a panicking constructor).
+The other high-severity findings, all now fixed, were: short-session `NaN` feature
+values silently dropping Detection events from the audit log (H4, fixed by an
+`is_finite` guard in `features.to_map()`); the spill-to-disk buffer not enforcing
+its configured size cap on the main enrolled path (H1, fixed by calling
+`enforce_cap` inside `Spill::push`); and the spill database being created
+world-readable while the agent's own key material is locked to 0600 (H2, fixed by
+creating the spill DB 0600 under a 0700 directory). The full findings table,
+per-finding remediation status, and a prioritized backlog are in
+`docs/security-audit.md`.
 
 The audit's methodology — parallel domain coverage followed by an adversarial
 per-finding verification pass — is explicitly designed to prevent the inflated
@@ -1054,11 +1116,11 @@ Aegis is a behavioral-surveillance tool with tamper resistance, a combination th
 
 **Synthetic evaluation only.** All quantitative results reported in this paper — including ROC-AUC of 1.000 at zero evasion budget and ROC-AUC degradation to 0.500 at full behavioral mimicry — come from sessions sampled from documented behavioral distributions, not from instrumented humans and autonomous agents in the field. The evaluation demonstrates that the pipeline and model cleanly separate the *modeled* behaviors and quantifies the evasion trade-off as a function of budget; it is not a claim of field accuracy. The CERT datasets [glasser2013cert] and keystroke benchmarks [killourhy2009] that have driven prior work in this area involve controlled or semi-controlled collection; a rigorous field study with IRB-approved data collection remains future work.
 
-**No eBPF ground-truth collector yet.** The single most important architectural recommendation to emerge from the game-theoretic analysis is that the model's six current features are all self-reported scalars: values the monitored process controls by calling `clock_nanosleep`, writing bytes one at a time, inserting deliberate backspaces, and so on. As long as features are self-reported, the classifier is directly invertible by a white-box adversary, and the equilibrium analysis (Section 4) confirms that the full behavioral mimic collapses detection to chance with evasion budget `e = 1.0`. Moving timing features to kernel-anchored collection via eBPF on the tty line discipline (`tty_insert_flip_string`/`n_tty_receive_buf`, `bpf_ktime_get_ns`) and correlating against HID/evdev interrupt presence — which a program writing to a pty inherently cannot fake — would raise the cost of evasion to capabilities an unprivileged process does not possess [le2020]. This is the highest-leverage planned enhancement, and it is not yet implemented.
+**No eBPF ground-truth collector yet.** The single most important architectural recommendation to emerge from the game-theoretic analysis is that all of the model's features — the six Tier-1 marginals and the Tier-2/3 joint-structure terms alike — are self-reported scalars derived from a stream the monitored process fully controls by calling `clock_nanosleep`, writing bytes one at a time, inserting deliberate backspaces, and so on. The joint-structure terms raise the *cost* of a convincing forgery but do not change the fact that the substrate is agent-controllable. As long as features are self-reported, the classifier is directly invertible by a white-box adversary, and the equilibrium analysis (Section 4) confirms that the full behavioral mimic collapses detection to chance with evasion budget `e = 1.0`. Moving timing features to kernel-anchored collection via eBPF on the tty line discipline (`tty_insert_flip_string`/`n_tty_receive_buf`, `bpf_ktime_get_ns`) and correlating against HID/evdev interrupt presence — which a program writing to a pty inherently cannot fake — would raise the cost of evasion to capabilities an unprivileged process does not possess [le2020]. This is the highest-leverage planned enhancement, and it is not yet implemented.
 
 **Single platform.** The current implementation targets Linux with systemd. The threat model, tamper-resistance design, and plugin architecture are platform-general in principle, but no macOS or Windows collectors, OS-level tamper mechanisms, or packaging exist. Portability is future work.
 
-**Transport and hardening assurance gaps.** The mTLS transport plugin (`plugin-transport`) is implemented — `tokio-rustls` TLS with certificate pinning, a one-time-token enrollment exchange, an Ed25519 challenge-response handshake bound to a fresh per-session server nonce, batched `EventBatch`/`BatchAck` forwarding, and spill-to-disk on link loss — and the hardening lifecycle (`Command::Install`/`Guard`/`Uninstall`) performs a real root-owned install with immutable units and a SHA-256 baseline manifest (Section 4.4). What remains open is *assurance*, not existence. On the network path, the protocol carries no per-message sequence number, so cross-session replay is not prevented and the server's in-session dedup set evicts non-deterministically (audit findings L3/L4); on the endpoint, the agent only attains its designed posture when the installer is run as root, and several installer- and loader-hardening findings (Section 8, e.g. the destination symlink-follow and the unverified dynamic-`.so` load) are still open. These hardening items, not a missing transport or installer, are the highest-priority remediation backlog.
+**Transport and hardening assurance gaps.** The mTLS transport plugin (`plugin-transport`) is implemented — `tokio-rustls` TLS with certificate pinning, a one-time-token enrollment exchange, an Ed25519 challenge-response handshake bound to a fresh per-session server nonce, batched `EventBatch`/`BatchAck` forwarding, and spill-to-disk on link loss — and has now been exercised end-to-end on real hardware (the live deployment of Section 7, where enrollment, mutual-TLS forwarding, and a central verdict all succeeded across separate hosts); the hardening lifecycle (`Command::Install`/`Guard`/`Uninstall`) likewise performs a real root-owned install with immutable units and a SHA-256 baseline manifest (Section 4.4). What remains open is *assurance*, not existence: the live test validated the happy path, not the adversarial one. Most of the audit's hardening findings have since been closed (the original cross-session replay and non-deterministic dedup-eviction findings L3/L4 are now fixed by a bounded cross-connection dedup window with FIFO eviction, and the installer symlink-follow is fixed by `O_NOFOLLOW` writes), though the protocol still carries no per-message sequence number, so replay resistance rests on the dedup window rather than a monotonic counter. On the endpoint, the agent only attains its designed posture when the installer is run as root, and the single substantive unverified-code finding — the dynamic-`.so` load with no integrity gate (audit H5) — is still open. Closing H5 and defaulting to a root install with a fail-loud weak-posture check, not a missing transport or installer, are the highest-priority remediation items.
 
 **White-box model coefficients.** Because the repository is open-source, all model weights, centers, slopes, thresholds, and the dead-band boundary are public. The security audit and game-theoretic analysis both confirm that a sophisticated adversary can compute `p_agent` offline for any candidate behavioral profile and tune to the cheapest evasion strategy — either the full mimic at `e = 1.0` or the dead-band camp at `p_agent ≈ 0.57`, which produces zero risk score with less mimicry fidelity than the full mimic [biggio2013, hu2025]. Making `Uncertain` verdicts actionable and moving final classification server-side with per-deployment signed coefficients are the two architectural responses, neither yet deployed.
 
@@ -1070,11 +1132,11 @@ Aegis is a behavioral-surveillance tool with tamper resistance, a combination th
 
 **Server-side classification and actionable dead band.** Moving the final logistic computation server-side and shipping per-deployment signed coefficients via an authenticated `ServerCommand::SetConfig` would break the offline invertibility that is the core structural weakness of the current design. Simultaneously, applying sequential probability ratio testing (SPRT) or an exponentially-weighted moving average (EWMA) across re-assessments would make sustained `Uncertain` sessions accumulate incremental risk rather than remaining at zero forever [tambe2011, paruchuri2008].
 
-**Anti-mimicry meta-features.** A behavioral profile that scores near-optimally on all six features simultaneously is statistically improbable for a real human; over-perfect profiles should raise, not lower, suspicion. Encoding this as an explicit feature — or as a non-additive ensemble with feature interactions — would defeat offline inversion that produces a globally-optimal evasion vector [biggio2018].
+**Anti-mimicry meta-features.** A behavioral profile that scores near-optimally on every feature simultaneously is statistically improbable for a real human; over-perfect profiles should raise, not lower, suspicion. Encoding this as an explicit feature — or as a non-additive ensemble with feature interactions — would defeat offline inversion that produces a globally-optimal evasion vector [biggio2018].
 
 **Field study and IRB-approved ground truth.** Replacing synthetic evaluation with data from real human operators and real LLM-driven automation would ground the ROC-AUC and evasion-budget curves in empirically measured behavioral distributions, and would allow the model to be trained on real digraph and correction-burst dynamics rather than parameterized approximations [gunetti2005free, monrose2000keystroke, acien2022typenet].
 
-**Hardening the implemented lifecycle and transport layer.** Root-run installation with `chattr +i` protection, a systemd watchdog pair, SHA-256 baseline manifest verification, and the mTLS/Ed25519 transport plugin are all implemented; the remaining work is assurance — closing the open installer- and loader-hardening audit findings (symlink-safe writes, effective-uid gating, signed/verified dynamic plugins), defaulting deployments to a root install with a fail-loud weak-posture check, and adding a per-message sequence number to foreclose cross-session replay — to move the system from "designed and built" to "verified for production."
+**Hardening the implemented lifecycle and transport layer.** Root-run installation with `chattr +i` protection, a systemd watchdog pair, SHA-256 baseline manifest verification, and the mTLS/Ed25519 transport plugin are all implemented, and most of the audit's hardening findings are now closed (symlink-safe `O_NOFOLLOW` writes and effective-uid gating among them); the remaining work is assurance — closing the one open loader finding by signing and verifying dynamic plugins (H5), defaulting deployments to a root install with a fail-loud weak-posture check, and adding a per-message sequence number to back the existing dedup-window replay defense with a monotonic counter — to move the system from "designed and built" to "verified for production."
 
 **Multi-session and cross-endpoint baselining.** The current model assesses each session independently. Accumulating evidence across sessions per user and across multiple endpoints per organization would close the evidence-gate evasion strategy (keeping each individual session below `MIN_COMMANDS = 3`) and would support drift detection when a human's baseline shifts [homoliak2019survey, tuor2017deepueba, yuan2021deepreview].
 
@@ -1086,7 +1148,7 @@ We have presented Aegis, a plugin-native, client/server platform for behavioral 
 
 The evaluation demonstrates that the current feature pipeline achieves ROC-AUC of 1.000 against naive automated agents and degrades monotonically with evasion budget to ROC-AUC of 0.500 at perfect behavioral mimicry — exactly as theory predicts, since a process that perfectly reproduces human timing is, behaviorally, indistinguishable. The value of the detector lies in the cost it imposes to reach that limit. The game-theoretic analysis identifies the key structural weakness: all current features are self-reported scalars that a white-box adversary can tune offline, and the dead-band strategy (`p_agent ≈ 0.57`) evades with near-zero mimicry fidelity because `Uncertain` verdicts currently contribute zero risk score. The architectural responses — eBPF kernel-anchored timing and server-side classification with per-deployment signed coefficients — are prioritized in the roadmap but not yet implemented; the third response, an EWMA sequential test that escalates sustained dead-band camping, *is* implemented in the live detector (Section 5), though making an `Uncertain` verdict accrue incremental risk on its own remains future work.
 
-Alongside these detection challenges, the security audit identified 28 confirmed findings (7 high, 10 medium, 11 low) in the current codebase. The most acute are: the plugin loader executing untrusted native code with no integrity gate before the enable check; short-session Detection events silently dropped due to `NaN` serialization; and the disk spill disk-cap never enforced on the hot path. The hardening lifecycle and transport layer are implemented but carry the open installer-, loader-, and replay-hardening findings above. These gaps are openly documented precisely because honest threat modeling is a prerequisite for responsible deployment of any behavioral-surveillance tool [cappelli2012cert, ball2021monitoring].
+Alongside these detection challenges, the security audit identified 28 confirmed findings (7 high, 10 medium, 11 low) in the codebase; 26 have since been fixed in code and re-verified against source, leaving the dynamic plugin loader executing untrusted native code with no integrity gate (H5) as the single substantive open item. The findings now closed include the short-session Detection events that `NaN` serialization once dropped, the disk spill cap that was unenforced on the hot path, and the cross-session replay and installer symlink-follow gaps. The hardening lifecycle and transport layer are implemented; what remains is closing H5, adding a per-message sequence number, and defaulting to a root install with a fail-loud weak-posture check. These gaps are openly documented precisely because honest threat modeling is a prerequisite for responsible deployment of any behavioral-surveillance tool [cappelli2012cert, ball2021monitoring].
 
 Taken together, Aegis demonstrates that a transparent, content-free, game-theoretically grounded approach to insider-threat detection is architecturally feasible and that the residual detection challenge reduces, on a hardened deployment, to the irreducible difficulty of distinguishing a sufficiently high-fidelity behavioral mimic from a human — a principled limit, not an implementation gap.
 

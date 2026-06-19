@@ -19,7 +19,7 @@
 //!   i.i.d.-delay evader fails to reproduce.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 /// Minimum keystrokes and commands required before we will emit a *provisional*
 /// verdict. Kept low so short sessions still resolve (leaning Tier-1 and, by
@@ -49,23 +49,30 @@ const SAMPLE_CAP: usize = 2048;
 
 /// Push `v` onto a bounded sample buffer, evicting the oldest sample once the
 /// buffer is at `SAMPLE_CAP` (rolling window).
+///
+/// Backed by a [`VecDeque`] so eviction is `pop_front()` (amortized O(1)) rather
+/// than `Vec::remove(0)` (O(n) memmove of the whole buffer). This matters because
+/// `push_capped` is on the per-keystroke / per-command hot path: a long-lived
+/// session at the cap previously paid an O(n) shift on *every* event, making a
+/// sustained session quadratic. The newest-`SAMPLE_CAP` semantics are unchanged.
 #[inline]
-fn push_capped(buf: &mut Vec<f64>, v: f64) {
+fn push_capped(buf: &mut VecDeque<f64>, v: f64) {
     if buf.len() >= SAMPLE_CAP {
-        buf.remove(0);
+        buf.pop_front();
     }
-    buf.push(v);
+    buf.push_back(v);
 }
 
 /// Per-session accumulator of raw behavioral observations.
 #[derive(Debug, Default, Clone)]
 pub struct SessionAccumulator {
-    /// Inter-keystroke gaps in milliseconds, in arrival order.
-    inter_arrivals_ms: Vec<f64>,
+    /// Inter-keystroke gaps in milliseconds, in arrival order. A `VecDeque` so the
+    /// rolling-window eviction in `push_capped` is O(1) on the keystroke hot path.
+    inter_arrivals_ms: VecDeque<f64>,
     /// Inter-command "think time" gaps in milliseconds, in arrival order.
-    inter_commands_ms: Vec<f64>,
+    inter_commands_ms: VecDeque<f64>,
     /// Per-command Shannon entropy (bits/char).
-    entropies: Vec<f64>,
+    entropies: VecDeque<f64>,
     keystrokes: u64,
     pastes: u64,
     commands: u64,
@@ -143,10 +150,17 @@ impl SessionAccumulator {
         if !self.enough_evidence() {
             return None;
         }
-        let (ka_mean, ka_std) = mean_std(&self.inter_arrivals_ms);
+        // Materialize the rolling windows into contiguous slices once (this is the
+        // verdict path, not the per-event hot path) so the statistics helpers keep
+        // their `&[f64]` signatures. The keystroke/command hot path stays O(1) via
+        // the `VecDeque` in `push_capped`.
+        let arrivals: Vec<f64> = self.inter_arrivals_ms.iter().copied().collect();
+        let commands: Vec<f64> = self.inter_commands_ms.iter().copied().collect();
+
+        let (ka_mean, ka_std) = mean_std(&arrivals);
         let keystroke_cv = if ka_mean > 0.0 { ka_std / ka_mean } else { 0.0 };
 
-        let (ic_mean, ic_std) = mean_std(&self.inter_commands_ms);
+        let (ic_mean, ic_std) = mean_std(&commands);
         let inter_command_cv = if ic_mean > 0.0 { ic_std / ic_mean } else { 0.0 };
         let cadence_regularity = 1.0 - inter_command_cv.min(1.0);
 
@@ -163,12 +177,7 @@ impl SessionAccumulator {
         // Within-burst keystroke variability: only gaps that plausibly belong to
         // one typing burst (gap < 300 ms). A char-by-char metronome has near-zero
         // CV here even if a few large idle gaps inflate the global CV.
-        let burst_gaps: Vec<f64> = self
-            .inter_arrivals_ms
-            .iter()
-            .copied()
-            .filter(|&g| g < 300.0)
-            .collect();
+        let burst_gaps: Vec<f64> = arrivals.iter().copied().filter(|&g| g < 300.0).collect();
         let keystroke_burst_cv = {
             let (m, s) = mean_std(&burst_gaps);
             if burst_gaps.len() >= 4 && m > 0.0 {
@@ -188,13 +197,13 @@ impl SessionAccumulator {
         // Tier-3 temporal features: require robust volume, else NaN sentinels.
         let robust = self.commands as usize >= MIN_COMMANDS_ROBUST;
         let gap_autocorr = if robust {
-            lag1_autocorr(&self.inter_commands_ms)
+            lag1_autocorr(&commands)
         } else {
             f64::NAN
         };
         let think_tail_ratio = if robust {
-            let p50 = percentile(&self.inter_commands_ms, 0.50);
-            let p90 = percentile(&self.inter_commands_ms, 0.90);
+            let p50 = percentile(&commands, 0.50);
+            let p90 = percentile(&commands, 0.90);
             if p50 > 0.0 {
                 p90 / p50
             } else {
@@ -204,7 +213,7 @@ impl SessionAccumulator {
             f64::NAN
         };
         let throughput_decay = if robust {
-            decay_slope(&self.inter_commands_ms)
+            decay_slope(&commands)
         } else {
             f64::NAN
         };

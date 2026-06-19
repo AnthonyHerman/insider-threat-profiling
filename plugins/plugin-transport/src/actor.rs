@@ -24,7 +24,7 @@ use aegis_proto::{read_message, write_message, Message, ServerCommand, PROTO_VER
 use aegis_sdk::{Emitter, Event, EventPayload, Severity};
 use rand::Rng;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{interval, Instant};
 use tokio_rustls::rustls::pki_types::ServerName;
 use uuid::Uuid;
@@ -190,43 +190,9 @@ fn backoff_delay(cfg: &TransportConfig, exp: u32) -> Duration {
     Duration::from_millis(jittered.max(1))
 }
 
-/// Parse `https://host:port` (scheme optional, port defaults to 8443) into the
-/// pieces TCP connect and TLS SNI need.
-///
-/// Only `https://` and bare host (no scheme) are accepted. An `http://` prefix
-/// is rejected with an error: the connection is always TLS regardless of scheme,
-/// so silently accepting `http://` misleads operators and could mask a
-/// misconfiguration. (The caller always calls `tls::connect`, but an explicit
-/// error makes the intent unambiguous.)
-fn parse_server(server: &str) -> anyhow::Result<(String, u16)> {
-    let trimmed = server.trim();
-    if trimmed.starts_with("http://") {
-        anyhow::bail!(
-            "server URL `{server}` uses http://; the transport is always TLS — \
-             use https:// or omit the scheme"
-        );
-    }
-    let s = trimmed.strip_prefix("https://").unwrap_or(trimmed);
-    let s = s.trim_end_matches('/');
-    if s.is_empty() {
-        anyhow::bail!("empty server address");
-    }
-    // Split host:port on the LAST colon to tolerate (rare) bracketless usage;
-    // bracketed IPv6 is not supported here (deployments use a hostname).
-    match s.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => {
-            let port: u16 = port
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid port in server `{server}`"))?;
-            Ok((host.to_string(), port))
-        }
-        _ => Ok((s.to_string(), 8443)),
-    }
-}
-
 /// One full connect → handshake → serve cycle. Returns how the session ended.
 async fn connect_and_serve(state: &mut ActorState, spill: &Arc<Mutex<Spill>>) -> SessionEnd {
-    let (host, port) = match parse_server(&state.cfg.server) {
+    let (host, port) = match crate::config::parse_server_url(&state.cfg.server) {
         Ok(hp) => hp,
         Err(e) => {
             tracing::error!(error = %e, server = %state.cfg.server, "transport: bad server URL");
@@ -348,11 +314,12 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let (hostname, os) = crate::config::host_facts();
     let hello = Message::ClientHello {
         proto_version: PROTO_VERSION,
         agent_id: state.agent_id.clone(),
-        hostname: hostname(),
-        os: os_string(),
+        hostname,
+        os,
         agent_pubkey: state
             .identity
             .signing_key
@@ -478,6 +445,11 @@ where
         (state.cfg.keepalive_timeout_ms / 4).max(1),
     ));
 
+    // Last observed ring drop count, so the watchdog can surface *new* ring loss
+    // (the only quantitative loss signal the front buffer exposes) rather than the
+    // counter sitting unread. Reported as a delta to avoid log spam.
+    let mut last_ring_dropped = state.ring.dropped();
+
     let end = loop {
         tokio::select! {
             // Reader hit an error/EOF → reconnect.
@@ -532,6 +504,19 @@ where
 
             // Watchdog + ack-timeout sweep.
             _ = watchdog.tick() => {
+                // Surface front-buffer loss: if the ring dropped events since the
+                // last sweep, log the delta and the lifetime total so loss is
+                // visible rather than a silent counter.
+                let dropped = state.ring.dropped();
+                if dropped > last_ring_dropped {
+                    tracing::warn!(
+                        newly_dropped = dropped - last_ring_dropped,
+                        total_dropped = dropped,
+                        "transport: ring dropped events (front buffer overflow)"
+                    );
+                    last_ring_dropped = dropped;
+                }
+
                 let silent = last_rx.lock().await.elapsed();
                 if silent > Duration::from_millis(state.cfg.keepalive_timeout_ms) {
                     tracing::warn!(silent_ms = silent.as_millis() as u64,
@@ -606,10 +591,15 @@ where
             Ok(spilled) => {
                 for se in spilled {
                     let sz = estimate_size(&se.event);
-                    if !events.is_empty()
-                        && (events.len() >= state.cfg.batch_max_events
-                            || est_bytes + sz > state.cfg.batch_max_bytes)
-                    {
+                    // Share the single tested budgeting predicate with the live-ring
+                    // path (`plan_batch`) instead of re-deriving the cap arithmetic.
+                    if !batch_has_room(
+                        events.len(),
+                        est_bytes,
+                        sz,
+                        state.cfg.batch_max_events,
+                        state.cfg.batch_max_bytes,
+                    ) {
                         break;
                     }
                     spill_high = Some(se.seq);
@@ -767,9 +757,17 @@ fn plan_batch(
     (taken, overflow)
 }
 
+/// Maximum number of server-`Command` dispatch tasks allowed in flight at once.
+/// A compromised (or buggy) server that streams commands faster than they can be
+/// handled would otherwise spawn unbounded tasks, each holding allocations and
+/// awaiting a (back-pressured) bus slot. Beyond this cap a command's reply is
+/// dropped rather than queued — the server retries idempotent commands.
+const MAX_INFLIGHT_COMMANDS: usize = 16;
+
 /// Spawn the reader task. It loops `read_message`, routes acks, dispatches each
-/// `Command` on its own task (so a slow handler never blocks reads), and updates
-/// `last_rx` on every inbound frame for the watchdog.
+/// `Command` on its own task (so a slow handler never blocks reads) under a
+/// bounded [`Semaphore`], replies to `Ping` inline, and updates `last_rx` on
+/// every inbound frame for the watchdog.
 fn spawn_reader<R, W>(
     mut rd: R,
     wr: Arc<Mutex<W>>,
@@ -783,6 +781,9 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // Cap concurrent command-dispatch tasks so a command flood cannot spawn an
+    // unbounded number of tasks all parked on bus back-pressure.
+    let cmd_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_COMMANDS));
     tokio::spawn(async move {
         loop {
             match read_message(&mut rd).await {
@@ -797,24 +798,40 @@ where
                             }
                         }
                         Message::Command { id, command } => {
-                            let wr = wr.clone();
-                            let agent_id = agent_id.clone();
-                            let emitter = emitter.clone();
-                            tokio::spawn(async move {
-                                let result =
-                                    dispatch_command(id, command, &agent_id, &emitter).await;
-                                if let Err(e) = send(&wr, &result).await {
-                                    tracing::warn!(error = %e, "transport: command result send failed");
+                            // Acquire a permit BEFORE spawning; move it into the
+                            // task so it is released on completion. If the cap is
+                            // reached, drop the command (do not queue unboundedly).
+                            match Arc::clone(&cmd_sem).try_acquire_owned() {
+                                Ok(permit) => {
+                                    let wr = wr.clone();
+                                    let agent_id = agent_id.clone();
+                                    let emitter = emitter.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        let result =
+                                            dispatch_command(id, command, &agent_id, &emitter)
+                                                .await;
+                                        if let Err(e) = send(&wr, &result).await {
+                                            tracing::warn!(error = %e, "transport: command result send failed");
+                                        }
+                                    });
                                 }
-                            });
+                                Err(_) => {
+                                    tracing::warn!(
+                                        %id,
+                                        cap = MAX_INFLIGHT_COMMANDS,
+                                        "transport: command dispatch at capacity; dropping command"
+                                    );
+                                }
+                            }
                         }
                         Message::Pong => { /* watchdog already refreshed */ }
                         Message::Ping => {
-                            // Server pinged us; pong back.
-                            let wr = wr.clone();
-                            tokio::spawn(async move {
-                                let _ = send(&wr, &Message::Pong).await;
-                            });
+                            // Server pinged us; pong back inline (no spawn) — a
+                            // single short write that cannot fan out into a flood.
+                            if let Err(e) = send(&wr, &Message::Pong).await {
+                                tracing::warn!(error = %e, "transport: pong send failed");
+                            }
                         }
                         other => {
                             tracing::debug!(
@@ -916,26 +933,6 @@ where
 {
     let mut guard = wr.lock().await;
     write_message(&mut *guard, msg).await
-}
-
-/// Best-effort hostname from `/proc/sys/kernel/hostname`.
-fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-/// OS descriptor: `std::env::consts::OS` plus the kernel release if available.
-fn os_string() -> String {
-    let base = std::env::consts::OS;
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    if release.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base} {release}")
-    }
 }
 
 #[cfg(test)]
@@ -1042,30 +1039,6 @@ mod tests {
         assert_eq!(bind_pin(None, &stale_fallback), stale_fallback);
         let empty: [CertificateDer; 0] = [];
         assert_eq!(bind_pin(Some(&empty), &stale_fallback), stale_fallback);
-    }
-
-    #[test]
-    fn parse_server_variants() {
-        assert_eq!(
-            parse_server("https://host:9000").unwrap(),
-            ("host".into(), 9000)
-        );
-        assert_eq!(parse_server("host:1234").unwrap(), ("host".into(), 1234));
-        assert_eq!(
-            parse_server("https://only-host").unwrap(),
-            ("only-host".into(), 8443)
-        );
-        assert_eq!(
-            parse_server("only-host").unwrap(),
-            ("only-host".into(), 8443)
-        );
-        // http:// is always rejected: the transport is TLS-only.
-        assert!(
-            parse_server("http://h:443/").is_err(),
-            "http:// must be rejected"
-        );
-        assert!(parse_server("").is_err());
-        assert!(parse_server("https://host:notaport").is_err());
     }
 
     #[test]

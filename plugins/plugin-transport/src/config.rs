@@ -3,8 +3,77 @@
 //! Every field is `#[serde(default = "...")]`-backed so a partial `[plugins.plugin-transport]`
 //! TOML subtree still deserializes (via [`PluginContext::config_as`]), with the
 //! documented operational defaults filled in for anything omitted.
+//!
+//! This module also hosts the shared host-fact and server-URL helpers used by
+//! *both* the connection actor's handshake and `aegis-agent enroll`, so the
+//! `ClientHello` and `EnrollRequest` sent to the same server cannot drift apart.
 
 use serde::{Deserialize, Serialize};
+
+/// Parse a `https://host:port` server URL (scheme optional, port defaults to
+/// `8443`) into the `(host, port)` TCP connect + TLS-SNI need.
+///
+/// Only `https://` and a bare host (no scheme) are accepted. An `http://` prefix
+/// is **rejected**: the transport is always TLS regardless of scheme, so silently
+/// accepting `http://` would mislead operators and could mask a misconfiguration.
+/// Shared by the forwarder actor and `aegis-agent enroll` so the same input is
+/// accepted (or rejected) identically by both.
+///
+/// Bracketed IPv6 is not supported (deployments use a hostname); the split is on
+/// the last `:` to tolerate rare bracketless usage.
+pub fn parse_server_url(server: &str) -> anyhow::Result<(String, u16)> {
+    let trimmed = server.trim();
+    if trimmed.starts_with("http://") {
+        anyhow::bail!(
+            "server URL `{server}` uses http://; the transport is always TLS — \
+             use https:// or omit the scheme"
+        );
+    }
+    let s = trimmed.strip_prefix("https://").unwrap_or(trimmed);
+    let s = s.trim_end_matches('/');
+    if s.is_empty() {
+        anyhow::bail!("empty server address");
+    }
+    match s.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => {
+            let port: u16 = port
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid port in server `{server}`"))?;
+            Ok((host.to_string(), port))
+        }
+        _ => Ok((s.to_string(), 8443)),
+    }
+}
+
+/// Best-effort `(hostname, os)` for the handshake/enroll messages.
+///
+/// `hostname` is read from `/proc/sys/kernel/hostname` (trimmed; `"unknown"` if
+/// unreadable); `os` is [`std::env::consts::OS`] plus the kernel release from
+/// `/proc/sys/kernel/osrelease` when available. Shared so the `ClientHello`
+/// (actor) and `EnrollRequest` (agent) always report identical host facts.
+pub fn host_facts() -> (String, String) {
+    (hostname(), os_string())
+}
+
+/// Best-effort hostname from `/proc/sys/kernel/hostname`.
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// OS descriptor: [`std::env::consts::OS`] plus the kernel release if available.
+fn os_string() -> String {
+    let base = std::env::consts::OS;
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if release.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} {release}")
+    }
+}
 
 /// Tunables for the transport sink and its connection actor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,5 +201,41 @@ mod tests {
         let v = TransportConfig::default();
         assert!(v.server.is_empty());
         assert_eq!(v.ring_capacity, 50_000);
+    }
+
+    #[test]
+    fn parse_server_url_variants() {
+        assert_eq!(
+            parse_server_url("https://host:9000").unwrap(),
+            ("host".into(), 9000)
+        );
+        assert_eq!(
+            parse_server_url("host:1234").unwrap(),
+            ("host".into(), 1234)
+        );
+        assert_eq!(
+            parse_server_url("https://only-host").unwrap(),
+            ("only-host".into(), 8443)
+        );
+        assert_eq!(
+            parse_server_url("only-host").unwrap(),
+            ("only-host".into(), 8443)
+        );
+        // http:// is always rejected (TLS-only transport); shared by actor + enroll.
+        assert!(
+            parse_server_url("http://h:443/").is_err(),
+            "http:// must be rejected"
+        );
+        assert!(parse_server_url("").is_err());
+        assert!(parse_server_url("https://host:notaport").is_err());
+    }
+
+    #[test]
+    fn host_facts_are_nonempty_and_stable() {
+        let (h1, o1) = host_facts();
+        let (h2, o2) = host_facts();
+        assert!(!h1.is_empty() && !o1.is_empty());
+        // Pure reads of /proc: identical across calls within a run.
+        assert_eq!((h1, o1), (h2, o2));
     }
 }

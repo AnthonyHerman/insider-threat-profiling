@@ -395,7 +395,9 @@ async fn enroll(args: EnrollArgs) -> anyhow::Result<()> {
     let agent_pubkey = signing_key.verifying_key().to_bytes().to_vec();
 
     // Parse host:port from the server URL (scheme optional, default port 8443).
-    let (host, port) = parse_server_url(&args.server)?;
+    // Shared with the forwarder actor so enroll and the running forwarder accept
+    // exactly the same inputs (notably both reject an http:// URL).
+    let (host, port) = plugin_transport::config::parse_server_url(&args.server)?;
 
     // Pinned TLS connect.
     let client_cfg = tls::client_config(vec![pin]);
@@ -408,11 +410,13 @@ async fn enroll(args: EnrollArgs) -> anyhow::Result<()> {
         .await
         .context("TLS handshake failed (server cert pin mismatch?)")?;
 
-    // Enroll exchange.
+    // Enroll exchange. Host facts come from the shared helper so the
+    // `EnrollRequest` reports identical hostname/os to the later `ClientHello`.
+    let (hostname, os) = plugin_transport::config::host_facts();
     let req = Message::EnrollRequest {
         token,
-        hostname: read_hostname(),
-        os: os_descriptor(),
+        hostname,
+        os,
         agent_pubkey,
     };
     write_message(&mut tls, &req)
@@ -447,48 +451,6 @@ async fn enroll(args: EnrollArgs) -> anyhow::Result<()> {
             );
         }
         other => anyhow::bail!("unexpected response to EnrollRequest: {other:?}"),
-    }
-}
-
-/// Parse `https://host:port` (scheme optional, port defaults to 8443).
-fn parse_server_url(server: &str) -> anyhow::Result<(String, u16)> {
-    let s = server
-        .trim()
-        .strip_prefix("https://")
-        .or_else(|| server.trim().strip_prefix("http://"))
-        .unwrap_or_else(|| server.trim())
-        .trim_end_matches('/');
-    if s.is_empty() {
-        anyhow::bail!("empty server address");
-    }
-    match s.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() => {
-            let port: u16 = p
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid port in `{server}`"))?;
-            Ok((h.to_string(), port))
-        }
-        _ => Ok((s.to_string(), 8443)),
-    }
-}
-
-/// Best-effort hostname for the enroll request.
-fn read_hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-/// OS descriptor: platform plus kernel release if available.
-fn os_descriptor() -> String {
-    let base = std::env::consts::OS;
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    if release.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base} {release}")
     }
 }
 

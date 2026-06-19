@@ -18,9 +18,10 @@ use aegis_sdk::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessConfig {
@@ -39,9 +40,35 @@ impl Default for ProcessConfig {
     }
 }
 
-#[derive(Default)]
+/// Stable per-process identity that survives PID reuse: the raw PID paired with
+/// the process start time (field 22 of `/proc/<pid>/stat`, in clock ticks since
+/// boot). When the kernel recycles a PID for a brand-new process the start time
+/// differs, so `(pid, starttime)` is distinct and the new exec is emitted —
+/// whereas a bare-PID key would suppress it as a "duplicate".
+type ProcKey = (u32, u64);
+
 pub struct ProcessPlugin {
-    seen: Arc<Mutex<HashSet<u32>>>,
+    /// Identities already emitted, keyed on [`ProcKey`] so a recycled PID is not
+    /// mistaken for the original process. `std::sync::Mutex` (not Tokio's): the
+    /// guard is only ever held for synchronous set operations, never across an
+    /// `.await`, so it cannot park the runtime — and the borrow checker enforces
+    /// that no `.await` sneaks inside the critical section.
+    seen: Arc<StdMutex<HashSet<ProcKey>>>,
+    /// Stop signal for the scan loop; fired by [`Plugin::shutdown`].
+    stop: watch::Sender<bool>,
+    /// Join handle of the spawned scan loop, awaited on shutdown so the task does
+    /// not outlive the host (it holds an `Arc<dyn Emitter>`).
+    handle: TokioMutex<Option<JoinHandle<()>>>,
+}
+
+impl Default for ProcessPlugin {
+    fn default() -> Self {
+        ProcessPlugin {
+            seen: Arc::new(StdMutex::new(HashSet::new())),
+            stop: watch::channel(false).0,
+            handle: TokioMutex::new(None),
+        }
+    }
 }
 
 #[async_trait]
@@ -64,46 +91,90 @@ impl Plugin for ProcessPlugin {
         let emitter = ctx.emitter.clone();
         let agent_id = ctx.agent_id.clone();
         let seen = self.seen.clone();
+        let mut stop = self.stop.subscribe();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(cfg.interval_ms.max(200)));
             loop {
-                ticker.tick().await;
-                let snapshot = match scan() {
-                    Ok(s) => s,
-                    Err(err) => {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    // Cooperative shutdown: stop the loop so the task (and the
+                    // `Arc<dyn Emitter>` it holds) does not outlive the host.
+                    res = stop.changed() => {
+                        // Sender dropped or `true` signalled: either way, stop.
+                        if res.is_err() || *stop.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                // `/proc` scanning is a burst of synchronous syscalls (read_dir +
+                // per-pid reads). Run it on the blocking pool so it never parks a
+                // Tokio worker thread shared with other tasks.
+                let snapshot = match tokio::task::spawn_blocking(scan).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(err)) => {
                         tracing::debug!(error = %err, "process scan failed");
                         continue;
                     }
-                };
-                let mut guard = seen.lock().await;
-                for proc in snapshot {
-                    if cfg.interactive_uids_only && proc.uid < 1000 {
+                    Err(err) => {
+                        tracing::debug!(error = %err, "process scan task failed");
                         continue;
                     }
-                    if guard.insert(proc.pid) {
-                        emitter
-                            .emit(Event::new(
-                                &agent_id,
-                                "plugin-process",
-                                EventPayload::ProcessExec {
-                                    pid: proc.pid,
-                                    ppid: proc.ppid,
-                                    uid: proc.uid,
-                                    exe: proc.comm.clone(),
-                                    cmdline: proc.cmdline.clone(),
-                                    cwd: None,
-                                },
-                            ))
-                            .await;
+                };
+
+                // Decide what to emit while holding the (synchronous) lock, then
+                // release it BEFORE awaiting any emit — the guard never spans an
+                // `.await`, so a back-pressured emit cannot block other lockers.
+                let to_emit: Vec<ProcInfo> = {
+                    let mut guard = seen.lock().expect("seen mutex poisoned");
+                    // Bound memory without re-emitting live processes: when the set
+                    // grows past a generous cap, retain only identities present in
+                    // the current snapshot (drop-dead-PIDs), rather than a wholesale
+                    // `clear()` that would treat every running process as new and
+                    // re-emit it on the next tick.
+                    if guard.len() > 65_536 {
+                        let live: HashSet<ProcKey> =
+                            snapshot.iter().map(|p| (p.pid, p.starttime)).collect();
+                        guard.retain(|k| live.contains(k));
                     }
-                }
-                // Bound memory: forget pids beyond a generous cap.
-                if guard.len() > 65_536 {
-                    guard.clear();
+                    snapshot
+                        .into_iter()
+                        .filter(|proc| !(cfg.interactive_uids_only && proc.uid < 1000))
+                        .filter(|proc| guard.insert((proc.pid, proc.starttime)))
+                        .collect()
+                };
+
+                for proc in to_emit {
+                    emitter
+                        .emit(Event::new(
+                            &agent_id,
+                            "plugin-process",
+                            EventPayload::ProcessExec {
+                                pid: proc.pid,
+                                ppid: proc.ppid,
+                                uid: proc.uid,
+                                exe: proc.comm,
+                                cmdline: proc.cmdline,
+                                cwd: None,
+                            },
+                        ))
+                        .await;
                 }
             }
         });
+        *self.handle.lock().await = Some(handle);
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        // Signal the scan loop to stop, then await it so the task is gone (and the
+        // emitter Arc released) before the host considers shutdown complete.
+        let _ = self.stop.send(true);
+        if let Some(handle) = self.handle.lock().await.take() {
+            let _ = handle.await;
+        }
         Ok(())
     }
 }
@@ -116,6 +187,11 @@ pub struct ProcInfo {
     pub uid: u32,
     pub comm: String,
     pub cmdline: Vec<String>,
+    /// Process start time in clock ticks since boot (field 22 of
+    /// `/proc/<pid>/stat`). Combined with `pid` this forms a stable identity that
+    /// survives PID reuse: a recycled PID gets a new start time, so a fresh
+    /// process is never mistaken for the (exited) original. `0` if unparseable.
+    pub starttime: u64,
 }
 
 /// Scan `/proc` for current processes. Returns an empty list on non-Linux.
@@ -138,6 +214,12 @@ pub fn scan() -> anyhow::Result<Vec<ProcInfo>> {
             Err(_) => continue,
         };
         let (ppid, uid) = parse_status(&status);
+        // Start time (field 22 of stat) keys the dedup set together with the pid so
+        // a recycled pid is treated as a new process. Best-effort: 0 if absent.
+        let starttime = std::fs::read_to_string(dir.join("stat"))
+            .ok()
+            .and_then(|s| parse_starttime(&s))
+            .unwrap_or(0);
         let comm = std::fs::read_to_string(dir.join("comm"))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
@@ -155,6 +237,7 @@ pub fn scan() -> anyhow::Result<Vec<ProcInfo>> {
             uid,
             comm,
             cmdline,
+            starttime,
         });
     }
     Ok(out)
@@ -179,6 +262,24 @@ fn parse_status(status: &str) -> (u32, u32) {
     (ppid, uid)
 }
 
+/// Extract the start time (field 22, clock ticks since boot) from a
+/// `/proc/<pid>/stat` line.
+///
+/// Field 2 (`comm`) is wrapped in parentheses and may itself contain spaces and
+/// parentheses (e.g. `(my )( proc)`), so we cannot naively split on whitespace.
+/// We anchor on the *last* `')'`: every field after it is single-token and
+/// space-separated, starting at field 3 (`state`). `starttime` is field 22, i.e.
+/// index 19 counting from `state` as 0. Returns `None` if the line is malformed.
+fn parse_starttime(stat: &str) -> Option<u64> {
+    let close = stat.rfind(')')?;
+    let after = stat.get(close + 1..)?;
+    // Fields 3.. are whitespace-separated; field 22 = index 19 from here.
+    after
+        .split_whitespace()
+        .nth(19)
+        .and_then(|s| s.parse().ok())
+}
+
 register_plugin!("plugin-process", || Box::new(ProcessPlugin::default()));
 
 #[cfg(test)]
@@ -197,5 +298,61 @@ mod tests {
     fn scan_runs_without_panicking() {
         // On Linux CI this returns real processes; elsewhere an empty vec.
         let _ = scan().unwrap();
+    }
+
+    /// `parse_starttime` reads field 22 even when the `comm` field contains
+    /// spaces and parentheses (the reason we anchor on the LAST `)`).
+    #[test]
+    fn parses_starttime_field_22() {
+        // Real-ish shape: pid (comm) state ppid ... starttime ...
+        // Fields 3..=22: state ppid pgrp session tty tpgid flags minflt cminflt
+        // majflt cmajflt utime stime cutime cstime priority nice threads itreal
+        // starttime(=22) -> 56789, then vsize, rss, ...
+        let stat = "4242 (bash) S 1 4242 4242 34816 4242 4194304 100 0 0 0 \
+                    1 2 3 4 20 0 1 0 56789 1234567 0";
+        assert_eq!(parse_starttime(stat), Some(56_789));
+
+        // A comm containing whitespace AND a literal ')' must not confuse the
+        // anchor — the last ')' is the one closing comm.
+        let weird = "7 (weird ) name) R 1 7 7 0 -1 0 0 0 0 0 \
+                     0 0 0 0 20 0 1 0 99 0 0";
+        assert_eq!(parse_starttime(weird), Some(99));
+
+        // Malformed (no closing paren / too few fields) -> None, not a panic.
+        assert_eq!(parse_starttime("garbage with no parens"), None);
+        assert_eq!(parse_starttime("1 (x) S 1 2 3"), None);
+    }
+
+    /// Regression for the PID-reuse defect: the dedup key is `(pid, starttime)`,
+    /// so a recycled PID with a *different* start time is a distinct identity and
+    /// is emitted, while a true repeat of the same `(pid, starttime)` is not.
+    #[test]
+    fn dedup_key_distinguishes_pid_reuse() {
+        let mut seen: HashSet<ProcKey> = HashSet::new();
+        // Original process at pid 100.
+        assert!(seen.insert((100, 1000)));
+        // Same identity seen again on the next tick -> suppressed.
+        assert!(!seen.insert((100, 1000)));
+        // PID 100 recycled for a brand-new process (new start time) -> emitted.
+        assert!(seen.insert((100, 2000)));
+    }
+
+    /// The bounded-eviction policy retains only identities present in the latest
+    /// snapshot, so live processes are never dropped (and thus never re-emitted),
+    /// unlike the old wholesale `clear()`.
+    #[test]
+    fn retain_keeps_live_and_drops_dead() {
+        let mut seen: HashSet<ProcKey> = HashSet::new();
+        for pid in 0..10u32 {
+            seen.insert((pid, 1));
+        }
+        // Snapshot only contains pids 5..10 still alive.
+        let live: HashSet<ProcKey> = (5..10u32).map(|p| (p, 1)).collect();
+        seen.retain(|k| live.contains(k));
+        assert_eq!(seen.len(), 5);
+        // A still-live pid is retained -> would NOT be re-emitted next tick.
+        assert!(!seen.insert((5, 1)));
+        // A dead pid was dropped -> if it ever reappears it is correctly re-emitted.
+        assert!(seen.insert((0, 1)));
     }
 }
