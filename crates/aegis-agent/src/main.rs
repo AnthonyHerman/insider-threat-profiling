@@ -9,14 +9,16 @@
 //! `inventory`-based registrations are present for static discovery.
 
 use aegis_core::{HostBuilder, HostConfig};
-use aegis_sdk::{Event, Plugin, PluginContext, PluginKind, PluginMetadata, Subscriptions};
+use aegis_sdk::{Emitter, Event, Plugin, PluginContext, PluginKind, PluginMetadata, Subscriptions};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 
 // Force-link the built-in plugins so their registrations are included.
 use plugin_process as _;
 use plugin_session as _;
 use plugin_tamper as _;
+use plugin_tty as _;
 
 #[derive(Parser)]
 #[command(name = "aegis-agent", version, about = "Aegis endpoint agent")]
@@ -38,6 +40,9 @@ enum Command {
         #[arg(long, default_value = "aegis-agent")]
         service: String,
     },
+    /// Run an instrumented interactive shell: your $SHELL inside a PTY,
+    /// emitting content-free behavioral telemetry (timing/structure only).
+    Shell(ShellArgs),
 }
 
 #[derive(Parser)]
@@ -67,6 +72,19 @@ struct InstallArgs {
     server: String,
 }
 
+#[derive(Parser)]
+struct ShellArgs {
+    /// Stable identity for this endpoint.
+    #[arg(long, env = "AEGIS_AGENT_ID", default_value = "agent-local")]
+    agent_id: String,
+    /// Per-deployment salt for the command-correlation hash.
+    #[arg(long, default_value = "aegis-default-salt")]
+    hash_salt: String,
+    /// Print emitted telemetry events (as JSON) to stderr.
+    #[arg(long)]
+    print_events: bool,
+}
+
 /// A small inline sink that prints events — demonstrates host embedding via
 /// `HostBuilder::with_plugin` and is handy when running interactively.
 struct ConsoleSink;
@@ -92,6 +110,26 @@ impl Plugin for ConsoleSink {
             event.source
         );
         Ok(())
+    }
+}
+
+/// A minimal [`Emitter`] used by the `shell` subcommand. The PTY passthrough
+/// owns stdout, so telemetry is written to **stderr** (or dropped) to avoid
+/// corrupting the interactive terminal stream.
+struct StderrEmitter {
+    print: bool,
+}
+
+#[async_trait]
+impl Emitter for StderrEmitter {
+    async fn emit(&self, event: Event) {
+        if self.print {
+            eprintln!(
+                "[{}] {}",
+                event.kind,
+                serde_json::to_string(&event.payload).unwrap_or_default()
+            );
+        }
     }
 }
 
@@ -138,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Shell(args) => shell(args).await,
     }
 }
 
@@ -161,5 +200,27 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down");
     running.shutdown().await?;
+    Ok(())
+}
+
+/// Run an instrumented interactive shell: spawns `$SHELL` inside a PTY and emits
+/// content-free behavioral telemetry. The terminal is put in raw mode for the
+/// duration and restored on exit. Telemetry goes to stderr (with
+/// `--print-events`) so it does not corrupt the PTY-owned stdout stream.
+async fn shell(args: ShellArgs) -> anyhow::Result<()> {
+    let emitter: Arc<dyn Emitter> = Arc::new(StderrEmitter {
+        print: args.print_events,
+    });
+    let session_id = plugin_tty::current_session_id();
+    let cfg = plugin_tty::AnalyzerConfig {
+        hash_salt: args.hash_salt,
+    };
+    let agent_id = args.agent_id;
+
+    // The PTY pump is blocking; run it off the async runtime and await it.
+    tokio::task::spawn_blocking(move || {
+        plugin_tty::run_instrumented_shell(emitter, agent_id, session_id, cfg)
+    })
+    .await??;
     Ok(())
 }

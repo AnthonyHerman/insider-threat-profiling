@@ -1,0 +1,23 @@
+[package]
+name = "plugin-tty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Collector plugin: interactive shell behavioral telemetry via PTY (timing/structure only, no content)."
+
+[dependencies]
+aegis-sdk.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Reuse the privacy-preserving command-statistics helpers; do NOT duplicate them.
+plugin-session = { path = "../plugin-session" }
+# PTY / termios / poll FFI (pure C bindings, musl-compatible).
+libc.workspace = true

@@ -98,6 +98,20 @@ pub struct ProfileParams {
     pub commands: (f64, f64),
     /// (mean, std) of keystrokes per typed command.
     pub keystrokes_per_cmd: (f64, f64),
+    /// AR(1) coefficient `φ ∈ [0,1)` on the *underlying-normal* think-time
+    /// process. Real operators' think times are **serially correlated** —
+    /// difficulty, context and concentration persist across adjacent commands —
+    /// so humans use `φ ≈ 0.45`. Automated agents react independently each time
+    /// (`φ = 0`). The AR(1) is variance-preserving, so the think-time marginal
+    /// (mean, tail) is unchanged; only the *autocorrelation* differs. This is
+    /// what the model's `gap-non-autocorrelation` term and the
+    /// `uncorrelated-flat-throughput` hard rule key on.
+    pub think_autocorr: f64,
+    /// Fractional drift of the think-time location across a session (fatigue).
+    /// Humans slow down over a long session (`+0.5` ⇒ think times ~50% longer by
+    /// the end), giving a *negative* throughput decay. Agents hold a constant
+    /// rate (`0.0`). Keyed on by the model's `no-throughput-decay` term.
+    pub think_fatigue: f64,
 }
 
 impl ProfileParams {
@@ -110,6 +124,8 @@ impl ProfileParams {
             entropy: (3.6, 0.3),
             commands: (8.0, 2.0),
             keystrokes_per_cmd: (24.0, 6.0),
+            think_autocorr: 0.45, // think times persist across commands
+            think_fatigue: 0.5,   // operator slows down over the session
         }
     }
 
@@ -122,6 +138,8 @@ impl ProfileParams {
             entropy: (4.7, 0.2),
             commands: (10.0, 3.0),
             keystrokes_per_cmd: (28.0, 8.0),
+            think_autocorr: 0.0, // independent reactions
+            think_fatigue: 0.0,  // constant throughput
         }
     }
 
@@ -133,39 +151,134 @@ impl ProfileParams {
     }
 }
 
-/// Generate one synthetic session and return the populated accumulator. The
-/// accumulator is the *real* one the plugin uses, so this exercises the genuine
-/// feature-extraction path.
-pub fn synth_session(params: &ProfileParams, rng: &mut Rng) -> SessionAccumulator {
-    let mut acc = SessionAccumulator::default();
-    let n_commands = rng.count(params.commands.0, params.commands.1, 3);
+/// One synthesized behavioral event, in arrival order. Mirrors the timing-only
+/// telemetry the collectors emit ([`Keystroke`](SynthEvent::Keystroke) /
+/// [`Command`](SynthEvent::Command)), so callers can either fold a whole session
+/// into an accumulator at once ([`synth_session`]) or replay it
+/// snapshot-by-snapshot (the sequential-test harness).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SynthEvent {
+    Keystroke {
+        inter_arrival_ns: u64,
+        is_paste: bool,
+        burst_len: u32,
+    },
+    Command {
+        inter_command_ns: u64,
+        had_backspace: bool,
+        entropy: f64,
+    },
+}
 
-    for _ in 0..n_commands {
+impl SynthEvent {
+    /// Apply this event to an accumulator (the genuine feature-extraction path).
+    pub fn apply(&self, acc: &mut SessionAccumulator) {
+        match *self {
+            SynthEvent::Keystroke {
+                inter_arrival_ns,
+                is_paste,
+                burst_len,
+            } => acc.record_keystroke(inter_arrival_ns, is_paste, burst_len),
+            SynthEvent::Command {
+                inter_command_ns,
+                had_backspace,
+                entropy,
+            } => acc.record_command(inter_command_ns, had_backspace, entropy),
+        }
+    }
+}
+
+/// Generate one synthetic session as an ordered [`SynthEvent`] stream.
+///
+/// `min_commands` forces at least that many commands (use `0` for the natural
+/// draw); the sequential-test harness forces a longer session so the robust
+/// Tier-3 features engage and there are multiple re-assessment snapshots. Human
+/// think times follow a variance-preserving AR(1) process with a fatigue drift
+/// (see [`ProfileParams::think_autocorr`]/[`ProfileParams::think_fatigue`]);
+/// agents react independently with constant throughput.
+pub fn synth_events(params: &ProfileParams, rng: &mut Rng, min_commands: u32) -> Vec<SynthEvent> {
+    let n_commands = rng.count(
+        params.commands.0.max(min_commands as f64),
+        params.commands.1,
+        min_commands.max(3),
+    );
+
+    // AR(1) state on the *underlying-normal* think time. We carry the previous
+    // deviation from the (drifting) mean so successive think times are serially
+    // correlated for humans (φ>0) and independent for agents (φ=0). The
+    // innovation is scaled by √(1−φ²) so the marginal variance — and hence the
+    // think-time tail — is preserved regardless of φ.
+    let (think_mu, think_sigma) = params.think_lognormal;
+    let phi = params.think_autocorr.clamp(0.0, 0.99);
+    let innov_scale = (1.0 - phi * phi).sqrt();
+    let mut prev_dev = 0.0f64; // previous (z - mu_t) deviation
+    let mut have_prev = false;
+
+    let mut events = Vec::new();
+    for cmd_i in 0..n_commands {
         let is_paste = rng.bernoulli(params.paste_p);
         let cmd_len = rng.count(params.keystrokes_per_cmd.0, params.keystrokes_per_cmd.1, 12);
 
         if is_paste {
             // A paste delivers the whole line atomically: one fast burst.
             let gap_ms = rng.lognormal(params.keystroke_lognormal.0.min(3.0), 0.2);
-            acc.record_keystroke((gap_ms * 1.0e6) as u64, true, cmd_len);
+            events.push(SynthEvent::Keystroke {
+                inter_arrival_ns: (gap_ms * 1.0e6) as u64,
+                is_paste: true,
+                burst_len: cmd_len,
+            });
         } else {
             // Typed character by character with profile-specific cadence.
             for _ in 0..cmd_len {
                 let gap_ms = rng
                     .lognormal(params.keystroke_lognormal.0, params.keystroke_lognormal.1)
                     .clamp(1.0, 5_000.0);
-                acc.record_keystroke((gap_ms * 1.0e6) as u64, false, 1);
+                events.push(SynthEvent::Keystroke {
+                    inter_arrival_ns: (gap_ms * 1.0e6) as u64,
+                    is_paste: false,
+                    burst_len: 1,
+                });
             }
         }
 
-        let think_ms = rng
-            .lognormal(params.think_lognormal.0, params.think_lognormal.1)
-            .clamp(1.0, 600_000.0);
-        let had_backspace = rng.bernoulli(params.backspace_p);
-        let entropy = rng
-            .normal(params.entropy.0, params.entropy.1)
-            .clamp(0.0, 8.0);
-        acc.record_command((think_ms * 1.0e6) as u64, had_backspace, entropy);
+        // Fatigue drift of the location, in [0, think_fatigue] across the session.
+        let frac = if n_commands > 1 {
+            cmd_i as f64 / (n_commands - 1) as f64
+        } else {
+            0.0
+        };
+        let mu_t = think_mu + (params.think_fatigue * frac);
+
+        // AR(1) step on the deviation; eps ~ N(0, sigma).
+        let eps = rng.normal(0.0, think_sigma);
+        let dev = if have_prev {
+            phi * prev_dev + innov_scale * eps
+        } else {
+            eps
+        };
+        prev_dev = dev;
+        have_prev = true;
+
+        let think_ms = (mu_t + dev).exp().clamp(1.0, 600_000.0);
+        events.push(SynthEvent::Command {
+            inter_command_ns: (think_ms * 1.0e6) as u64,
+            had_backspace: rng.bernoulli(params.backspace_p),
+            entropy: rng
+                .normal(params.entropy.0, params.entropy.1)
+                .clamp(0.0, 8.0),
+        });
+    }
+    events
+}
+
+/// Generate one synthetic session and return the populated accumulator. The
+/// accumulator is the *real* one the plugin uses, so this exercises the genuine
+/// feature-extraction path. Equivalent to folding [`synth_events`] (natural
+/// length) into a fresh accumulator.
+pub fn synth_session(params: &ProfileParams, rng: &mut Rng) -> SessionAccumulator {
+    let mut acc = SessionAccumulator::default();
+    for evt in synth_events(params, rng, 0) {
+        evt.apply(&mut acc);
     }
     acc
 }

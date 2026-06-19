@@ -19,6 +19,7 @@ aegis-proto.workspace = true
 # Built-in plugins linked into the agent (collectors + self-protection).
 plugin-process = { path = "../../plugins/plugin-process" }
 plugin-session = { path = "../../plugins/plugin-session" }
+plugin-tty = { path = "../../plugins/plugin-tty" }
 plugin-tamper = { path = "../../plugins/plugin-tamper" }
 
 tokio.workspace = true

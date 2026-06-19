@@ -9,6 +9,7 @@ members = [
     "crates/aegis-cli",
     "plugins/plugin-process",
     "plugins/plugin-session",
+    "plugins/plugin-tty",
     "plugins/plugin-agent-detect",
     "plugins/plugin-scoring",
     "plugins/plugin-tamper",
@@ -68,6 +69,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # Plugins
 inventory = "0.3"
 libloading = "0.8"
+libc = "0.2"
 
 # Stats / time
 statrs = "0.17"
