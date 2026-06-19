@@ -1,0 +1,30 @@
+[package]
+name = "plugin-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Sink plugin: forwards telemetry to the Aegis server over mutual-auth TLS."
+
+[dependencies]
+aegis-sdk.workspace = true
+aegis-proto.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+redb.workspace = true
+base64.workspace = true
+rand.workspace = true
+uuid.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

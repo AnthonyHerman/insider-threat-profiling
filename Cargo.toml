@@ -13,6 +13,7 @@ members = [
     "plugins/plugin-agent-detect",
     "plugins/plugin-scoring",
     "plugins/plugin-tamper",
+    "plugins/plugin-transport",
 ]
 
 [workspace.package]
@@ -48,6 +49,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
+base64 = "0.22"
 
 # Storage (pure-Rust embedded)
 redb = "2"
@@ -79,6 +81,7 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 aegis-sdk = { path = "crates/aegis-sdk" }
 aegis-core = { path = "crates/aegis-core" }
 aegis-proto = { path = "crates/aegis-proto" }
+plugin-transport = { path = "plugins/plugin-transport" }
 
 [profile.release]
 opt-level = 3

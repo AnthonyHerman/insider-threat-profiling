@@ -246,11 +246,257 @@ register_plugin!("plugin-agent-detect", || Box::new(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aegis_sdk::{Emitter, SessionId};
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn metadata_is_processor() {
         let p = AgentDetectPlugin::default();
         assert_eq!(p.metadata().kind, PluginKind::Processor);
         assert_eq!(p.metadata().name, "plugin-agent-detect");
+    }
+
+    #[test]
+    fn detect_config_defaults_are_sane() {
+        let c = DetectConfig::default();
+        assert_eq!(c.assess_every, 10);
+        assert!(c.assess_on_session_end);
+        assert!((c.ewma_alpha - 0.3).abs() < 1e-9);
+        assert!((c.escalate_logit - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn detect_config_parses_without_new_keys() {
+        // Wire-compat: a config written before the sequential keys existed must
+        // still deserialize, picking up the serde defaults.
+        let json = serde_json::json!({
+            "assess_every": 5,
+            "assess_on_session_end": false
+        });
+        let c: DetectConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(c.assess_every, 5);
+        assert!(!c.assess_on_session_end);
+        assert!((c.ewma_alpha - 0.3).abs() < 1e-9);
+        assert!((c.escalate_logit - 0.25).abs() < 1e-9);
+    }
+
+    /// Test emitter that captures every emitted event.
+    #[derive(Default)]
+    struct CapturingEmitter {
+        events: Arc<StdMutex<Vec<Event>>>,
+    }
+
+    #[async_trait]
+    impl Emitter for CapturingEmitter {
+        async fn emit(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn test_ctx(emitter: Arc<CapturingEmitter>) -> PluginContext {
+        PluginContext {
+            agent_id: "test-agent".into(),
+            data_dir: std::env::temp_dir(),
+            config: serde_json::Value::Null,
+            emitter,
+        }
+    }
+
+    /// Drive the *real* plugin end-to-end over a long, mid-evasion (e=0.5)
+    /// session and assert the wired-up sequential escalation fires: at least one
+    /// emitted Detection carries the `sequential-escalation` reason and the
+    /// `Agent` verdict, proving `maybe_emit`'s SPRT/EWMA path works in
+    /// production (not just the eval replica).
+    #[tokio::test]
+    async fn sequential_escalation_emits_agent_detection_end_to_end() {
+        use crate::synth::{synth_events, ProfileParams, Rng, SynthEvent};
+
+        // e=0.5 partial mimic params (mirrors eval::evade(0.5)).
+        let h = ProfileParams::human();
+        let a = ProfileParams::agent();
+        let lerp = |x: f64, y: f64| x + (y - x) * 0.5;
+        let l2 = |x: (f64, f64), y: (f64, f64)| (lerp(x.0, y.0), lerp(x.1, y.1));
+        let partial = ProfileParams {
+            keystroke_lognormal: l2(a.keystroke_lognormal, h.keystroke_lognormal),
+            think_lognormal: l2(a.think_lognormal, h.think_lognormal),
+            backspace_p: lerp(a.backspace_p, h.backspace_p),
+            paste_p: lerp(a.paste_p, h.paste_p),
+            entropy: l2(a.entropy, h.entropy),
+            commands: l2(a.commands, h.commands),
+            keystrokes_per_cmd: l2(a.keystrokes_per_cmd, h.keystrokes_per_cmd),
+            think_autocorr: lerp(a.think_autocorr, h.think_autocorr),
+            think_fatigue: lerp(a.think_fatigue, h.think_fatigue),
+        };
+
+        // Search a handful of seeds for a session that escalates (the cohort
+        // escalation rate is high but not 100%, so a single fixed seed could be
+        // one of the ~30% that legitimately stays Uncertain). This stays
+        // deterministic and asserts the production path *can* and *does*
+        // escalate a sustained agent-leaner.
+        let mut escalated_once = false;
+        for seed in 0u64..12 {
+            let emitter = Arc::new(CapturingEmitter::default());
+            let ctx = test_ctx(emitter.clone());
+            let plugin = AgentDetectPlugin::default();
+            let sid: SessionId = format!("sess-{seed}");
+
+            plugin
+                .handle(
+                    &Event::new(
+                        "test-agent",
+                        "test",
+                        EventPayload::SessionStart {
+                            session_id: sid.clone(),
+                            tty: None,
+                            user: "u".into(),
+                            remote: None,
+                        },
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+
+            let mut rng = Rng::new(seed);
+            for evt in synth_events(&partial, &mut rng, 22) {
+                let payload = match evt {
+                    SynthEvent::Keystroke {
+                        inter_arrival_ns,
+                        is_paste,
+                        burst_len,
+                    } => EventPayload::Keystroke {
+                        session_id: sid.clone(),
+                        inter_arrival_ns,
+                        is_paste,
+                        burst_len,
+                    },
+                    SynthEvent::Command {
+                        inter_command_ns,
+                        had_backspace,
+                        entropy,
+                    } => EventPayload::CommandObserved {
+                        session_id: sid.clone(),
+                        command_len: 20,
+                        token_count: 3,
+                        shannon_entropy: entropy,
+                        had_backspace,
+                        edit_distance_prev: 5,
+                        inter_command_ns,
+                        command_hash: "h".into(),
+                    },
+                };
+                plugin
+                    .handle(&Event::new("test-agent", "test", payload), &ctx)
+                    .await
+                    .unwrap();
+            }
+            // Session end → final forced assessment.
+            plugin
+                .handle(
+                    &Event::new(
+                        "test-agent",
+                        "test",
+                        EventPayload::SessionEnd {
+                            session_id: sid.clone(),
+                        },
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+
+            let events = emitter.events.lock().unwrap();
+            // Detections were emitted at the assess cadence.
+            let detections: Vec<&Event> = events
+                .iter()
+                .filter(|e| matches!(e.payload, EventPayload::Detection { .. }))
+                .collect();
+            assert!(
+                !detections.is_empty(),
+                "expected the plugin to emit Detections"
+            );
+            // Look for a sequential escalation.
+            for e in &detections {
+                if let EventPayload::Detection {
+                    verdict, reasons, ..
+                } = &e.payload
+                {
+                    if *verdict == Verdict::Agent
+                        && reasons.iter().any(|r| r == "sequential-escalation")
+                    {
+                        escalated_once = true;
+                    }
+                }
+            }
+            if escalated_once {
+                break;
+            }
+        }
+        assert!(
+            escalated_once,
+            "sequential escalation never fired across seeds — the wired-up SPRT/EWMA path is not escalating sustained agent-leaners"
+        );
+    }
+
+    /// A genuine, sustained Human session must NOT be escalated to Agent by the
+    /// sequential path (escalation is one-directional and gated on Uncertain).
+    #[tokio::test]
+    async fn sequential_does_not_escalate_clear_human_end_to_end() {
+        use crate::synth::{synth_events, ProfileParams, Rng, SynthEvent};
+
+        let mut any_detection = false;
+        for seed in 0u64..6 {
+            let emitter = Arc::new(CapturingEmitter::default());
+            let ctx = test_ctx(emitter.clone());
+            let plugin = AgentDetectPlugin::default();
+            let sid: SessionId = format!("h-{seed}");
+            let mut rng = Rng::new(seed);
+            for evt in synth_events(&ProfileParams::human(), &mut rng, 22) {
+                let payload = match evt {
+                    SynthEvent::Keystroke {
+                        inter_arrival_ns,
+                        is_paste,
+                        burst_len,
+                    } => EventPayload::Keystroke {
+                        session_id: sid.clone(),
+                        inter_arrival_ns,
+                        is_paste,
+                        burst_len,
+                    },
+                    SynthEvent::Command {
+                        inter_command_ns,
+                        had_backspace,
+                        entropy,
+                    } => EventPayload::CommandObserved {
+                        session_id: sid.clone(),
+                        command_len: 20,
+                        token_count: 3,
+                        shannon_entropy: entropy,
+                        had_backspace,
+                        edit_distance_prev: 5,
+                        inter_command_ns,
+                        command_hash: "h".into(),
+                    },
+                };
+                plugin
+                    .handle(&Event::new("test-agent", "test", payload), &ctx)
+                    .await
+                    .unwrap();
+            }
+            let events = emitter.events.lock().unwrap();
+            for e in events.iter() {
+                if let EventPayload::Detection {
+                    verdict, reasons, ..
+                } = &e.payload
+                {
+                    any_detection = true;
+                    assert!(
+                        !reasons.iter().any(|r| r == "sequential-escalation"),
+                        "a clear human session was sequentially escalated (verdict {verdict:?})"
+                    );
+                }
+            }
+        }
+        assert!(any_detection, "expected at least one human Detection emitted");
     }
 }

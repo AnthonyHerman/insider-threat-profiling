@@ -320,12 +320,29 @@ fn decay_slope(gaps: &[f64]) -> f64 {
     (rel * 1.5).tanh()
 }
 
+/// Returns `NaN` as the serde default for fields that encode "no evidence
+/// available" with `NaN` in the live pipeline. Using `NaN` rather than `0.0`
+/// ensures that any FeatureVector deserialized from an old-format payload (which
+/// lacked the Tier-2/3 fields) is treated as under-evidenced — exactly as it
+/// would be if the feature had not yet reached the robust gate — rather than as
+/// the `0` that indicates strong i.i.d.-padding agent evidence.
+fn nan_default() -> f64 {
+    f64::NAN
+}
+
 /// The standardized behavioral feature vector consumed by the model.
 ///
 /// The first six fields are the original Tier-1 marginals. The remaining fields
 /// (added later) carry the evasion-robust Tier-2/3 evidence and the
-/// physiological hard-rule inputs. They are `#[serde(default)]` so vectors
-/// serialized before they existed still deserialize (missing ⇒ `0.0`).
+/// physiological hard-rule inputs. Fields with `#[serde(default = "nan_default")]`
+/// deserialize to `NaN` when the field is absent from the payload (i.e. serialized
+/// before this field existed), so the model skips and renormalizes rather than
+/// treating a missing field as strong agent evidence.
+///
+/// Fields that are meaningful at zero (`reaction_floor_hits`,
+/// `whole_line_paste_ratio`) use `#[serde(default)]` (→ `0.0`) because their
+/// absence in an old payload genuinely corresponds to "zero floor hits / zero
+/// whole-line pastes" — the safe, FPR-protecting interpretation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct FeatureVector {
     /// Coefficient of variation of inter-keystroke timing. Humans are bursty and
@@ -349,30 +366,35 @@ pub struct FeatureVector {
 
     /// Lag-1 autocorrelation of inter-command think times. i.i.d. injected
     /// delays ⇒ ≈0 (agent); genuine operators ⇒ 0.1–0.6. `NaN` below the robust
-    /// command gate. *(Tier 3 — traps the cheapest evasion)*
-    #[serde(default)]
+    /// command gate or when absent from an old payload. *(Tier 3 — traps the
+    /// cheapest evasion)*
+    #[serde(default = "nan_default")]
     pub gap_autocorr: f64,
     /// p90/p50 of inter-command think times. Constant/uniform padding ⇒ ≈1
-    /// (agent); humans have heavy tails ⇒ >4. `NaN` below the robust gate.
-    /// *(Tier 2)*
-    #[serde(default)]
+    /// (agent); humans have heavy tails ⇒ >4. `NaN` below the robust gate or when
+    /// absent from an old payload. *(Tier 2)*
+    #[serde(default = "nan_default")]
     pub think_tail_ratio: f64,
     /// Normalized throughput decay in [-1,1]. Negative ⇒ slowing (human
-    /// fatigue); flat/positive ⇒ agent. `NaN` below the robust gate. *(Tier 3)*
-    #[serde(default)]
+    /// fatigue); flat/positive ⇒ agent. `NaN` below the robust gate or when absent
+    /// from an old payload. *(Tier 3)*
+    #[serde(default = "nan_default")]
     pub throughput_decay: f64,
     /// Fraction of non-paste command gaps below the ~150 ms physiological
     /// reaction floor. A hard-rule input: even a single slip incriminates a long
-    /// session. *(Tier 3 hard-rule input)*
+    /// session. Defaults to `0.0` (no floor hits) when absent — the safe,
+    /// FPR-protecting interpretation. *(Tier 3 hard-rule input)*
     #[serde(default)]
     pub reaction_floor_hits: f64,
     /// Fraction of commands delivered as a single whole-line paste burst.
-    /// Refines `paste_ratio` toward the agent-shaped atomic delivery. *(Tier 3)*
+    /// Refines `paste_ratio` toward the agent-shaped atomic delivery. Defaults to
+    /// `0.0` (no whole-line pastes) when absent. *(Tier 3)*
     #[serde(default)]
     pub whole_line_paste_ratio: f64,
     /// CV of within-burst keystroke gaps (gaps < 300 ms). Sharpens metronomic
-    /// detection of char-by-char fakes. `NaN` with too few burst gaps. *(Tier 2)*
-    #[serde(default)]
+    /// detection of char-by-char fakes. `NaN` with too few burst gaps or when
+    /// absent from an old payload. *(Tier 2)*
+    #[serde(default = "nan_default")]
     pub keystroke_burst_cv: f64,
 }
 
@@ -537,6 +559,59 @@ mod tests {
             decay_slope(&flat).abs() < 1e-6,
             "flat {}",
             decay_slope(&flat)
+        );
+    }
+
+    /// Absent Tier-2/3 fields in an old-format JSON payload must deserialize as
+    /// `NaN` (no evidence) rather than `0.0` (strong agent evidence). Concretely:
+    /// `gap_autocorr=0.0` would feed `sigmoid(6*(0.18-0.0))≈0.75` as strong
+    /// i.i.d.-padding evidence; the fix ensures a missing field becomes `NaN`
+    /// so the model skips and renormalizes, giving the FPR-protecting result.
+    #[test]
+    fn old_format_deserialization_defaults_nan_for_tier3_fields() {
+        // A minimal serialized FeatureVector with only the original Tier-1 fields.
+        let json = r#"{
+            "keystroke_cv": 0.9,
+            "paste_ratio": 0.0,
+            "mean_inter_command_ms": 4000.0,
+            "backspace_ratio": 0.2,
+            "entropy_mean": 3.5,
+            "cadence_regularity": 0.2
+        }"#;
+        let fv: FeatureVector = serde_json::from_str(json).expect("deserialize");
+        // The three Tier-3 temporal features that previously defaulted to 0.0
+        // (strong agent evidence) must now default to NaN (no evidence).
+        assert!(fv.gap_autocorr.is_nan(), "gap_autocorr should be NaN, got {}", fv.gap_autocorr);
+        assert!(fv.think_tail_ratio.is_nan(), "think_tail_ratio should be NaN, got {}", fv.think_tail_ratio);
+        assert!(fv.throughput_decay.is_nan(), "throughput_decay should be NaN, got {}", fv.throughput_decay);
+        assert!(fv.keystroke_burst_cv.is_nan(), "keystroke_burst_cv should be NaN, got {}", fv.keystroke_burst_cv);
+        // Fields that are safe at 0.0 still default to 0.0 (no-hit / no-paste).
+        assert_eq!(fv.reaction_floor_hits, 0.0);
+        assert_eq!(fv.whole_line_paste_ratio, 0.0);
+    }
+
+    /// Verify that the model rates an old-format (Tier-1 only) human vector as
+    /// non-Agent even after the serde fix — the NaN renormalization path must
+    /// not push a human toward Agent when Tier-3 fields are absent.
+    #[test]
+    fn old_format_human_not_falsely_escalated() {
+        use crate::model::Model;
+        use aegis_sdk::Verdict;
+        let json = r#"{
+            "keystroke_cv": 0.9,
+            "paste_ratio": 0.0,
+            "mean_inter_command_ms": 4000.0,
+            "backspace_ratio": 0.2,
+            "entropy_mean": 3.5,
+            "cadence_regularity": 0.2
+        }"#;
+        let fv: FeatureVector = serde_json::from_str(json).expect("deserialize");
+        let a = Model::default().assess(&fv);
+        assert_ne!(
+            a.verdict,
+            Verdict::Agent,
+            "old-format human payload incorrectly escalated to Agent (p_agent={})",
+            a.p_agent
         );
     }
 }

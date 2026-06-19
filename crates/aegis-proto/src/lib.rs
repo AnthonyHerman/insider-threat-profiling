@@ -10,11 +10,22 @@
 //! per-agent Ed25519 keys) are layered *under* this protocol by the transport
 //! plugin and the server; this crate defines only the message grammar and
 //! framing.
+//!
+//! Server authentication uses agent-side SHA-256 certificate pinning (see
+//! [`pin`]), not a public-CA / X.509 client-cert handshake; agent
+//! authentication uses a per-agent Ed25519 signature over a domain-separated,
+//! channel-bound nonce carried in a [`Message::Command`]`{`[`ServerCommand::Noop`]`}`
+//! challenge. The reusable TLS-config and challenge-digest construction live in
+//! the [`tls`] module so that agent (signer) and server (verifier) share one
+//! implementation.
 
 use aegis_sdk::Event;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
+
+pub mod pin;
+pub mod tls;
 
 /// Bumped on any breaking change to [`Message`].
 pub const PROTO_VERSION: u16 = 1;

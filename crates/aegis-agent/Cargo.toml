@@ -16,13 +16,15 @@ path = "src/main.rs"
 aegis-core.workspace = true
 aegis-sdk.workspace = true
 aegis-proto.workspace = true
-# Built-in plugins linked into the agent (collectors + self-protection).
+# Built-in plugins linked into the agent (collectors + self-protection + forwarder).
 plugin-process = { path = "../../plugins/plugin-process" }
 plugin-session = { path = "../../plugins/plugin-session" }
 plugin-tty = { path = "../../plugins/plugin-tty" }
 plugin-tamper = { path = "../../plugins/plugin-tamper" }
+plugin-transport.workspace = true
 
 tokio.workspace = true
+tokio-rustls.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
