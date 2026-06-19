@@ -63,6 +63,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "aegis-core",
+ "aegis-sdk",
+ "anyhow",
+ "async-trait",
+ "plugin-agent-detect",
+ "plugin-scoring",
+ "tokio",
+]
+
+[[package]]
 name = "aegis-proto"
 version = "0.1.0"
 dependencies = [

@@ -137,7 +137,7 @@ impl Plugin for ScoringPlugin {
     }
 
     fn subscriptions(&self) -> Subscriptions {
-        Subscriptions::kinds(["detection", "process.exec", "alert", "session.end"])
+        Subscriptions::kinds(["detection", "process.exec", "session.end"])
     }
 
     async fn init(&mut self, ctx: &PluginContext) -> anyhow::Result<()> {

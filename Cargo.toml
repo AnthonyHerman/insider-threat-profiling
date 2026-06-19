@@ -7,6 +7,7 @@ members = [
     "crates/aegis-agent",
     "crates/aegis-server",
     "crates/aegis-cli",
+    "crates/aegis-integration-tests",
     "plugins/plugin-process",
     "plugins/plugin-session",
     "plugins/plugin-tty",

@@ -1,0 +1,32 @@
+[package]
+name = "aegis-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "In-process end-to-end pipeline tests for the Aegis event bus and central processors."
+publish = false
+
+# Test-only crate: no public library surface. An (empty) lib keeps this a normal
+# crate so the real tests can live as integration tests under `tests/`.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# The real kernel: event bus, dispatcher, plugin host lifecycle.
+aegis-core = { workspace = true }
+# Event/plugin contract (Event, EventPayload, Plugin, Subscriptions, Verdict).
+aegis-sdk = { workspace = true }
+# The two central processors under test, added as plain library dependencies and
+# instantiated directly — they are ordinary `[lib]` crates depending only on
+# aegis-sdk, so no dynamic loading or `inventory` is needed.
+plugin-agent-detect = { path = "../../plugins/plugin-agent-detect" }
+plugin-scoring = { path = "../../plugins/plugin-scoring" }
+# CapturingSink implements the async `Plugin` trait.
+async-trait = { workspace = true }
+# Multi-threaded runtime so the dispatcher and per-plugin handler tasks make
+# progress concurrently while a test polls the captured events.
+tokio = { workspace = true }
+anyhow = { workspace = true }
