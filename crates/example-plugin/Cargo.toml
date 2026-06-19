@@ -1,0 +1,25 @@
+[package]
+name = "example-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Example third-party Aegis plugin shipped as a runtime-loaded cdylib."
+publish = false
+
+# Build a C-ABI shared object (libexample_plugin.so) so the host can load it at
+# runtime via `aegis_core::load_dynamic` (dlopen). This crate is intentionally
+# NOT a normal `[lib]`: it is never linked into a host binary, and it does not
+# use `register_plugin!`/`inventory`. The only way it reaches a host is the
+# C-ABI entrypoint resolved at runtime — which is exactly the capability the
+# accompanying integration test proves.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aegis-sdk = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

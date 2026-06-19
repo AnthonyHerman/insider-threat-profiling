@@ -30,3 +30,6 @@ async-trait = { workspace = true }
 # progress concurrently while a test polls the captured events.
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# The dynamic-load test inspects the captured `Custom` payload (a serde_json
+# value) to confirm the runtime-loaded plugin actually emitted its marker event.
+serde_json = { workspace = true }
