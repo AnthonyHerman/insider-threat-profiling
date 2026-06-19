@@ -59,6 +59,24 @@ pub async fn run_pipe(
     let file = tokio::fs::File::open(&path).await?;
     let mut lines = BufReader::new(file).lines();
 
+    // Register the session up front. Pipe mode has no PTY login event, and
+    // downstream processors (agent-detect) deliberately DROP telemetry for any
+    // session they never saw start — so without our own SessionStart the
+    // keystrokes/commands are discarded unless some other plugin happens to emit
+    // a SessionStart with an identical session_id. Emitting it here makes the
+    // collector self-sufficient. Content-free: only the session id + user.
+    pump_event(
+        &emitter,
+        &agent_id,
+        EventPayload::SessionStart {
+            session_id: session_id.clone(),
+            tty: None,
+            user: std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
+            remote: None,
+        },
+    )
+    .await;
+
     let mut analyzer = Analyzer::new(session_id, cfg);
 
     while let Some(line) = lines.next_line().await? {

@@ -65,20 +65,36 @@ echo "wrote $(wc -l < "$PIPE") synthetic command lines"
 echo "### 5. Agent config: plugin-tty in pipe mode reading the synthetic input"
 cat > "$WORK/agent.toml" <<EOF
 agent_id = "demo-host"
+# Focus this demo on the agent-vs-human path: disable the /proc collector (whose
+# startup burst can crowd the forwarder ring on a low-core box) and the tamper
+# control plugin (which only alerts when run non-root, unrelated to this demo).
+disabled_plugins = ["plugin-process", "plugin-tamper"]
 [plugins."plugin-tty"]
 mode = "pipe"
 pipe_path = "$PIPE"
 EOF
 
-echo "### 6. Run the agent (collect + forward over mTLS) for a few seconds"
-timeout 10 "$BIN/aegis-agent" run --server "https://$TLS" --config "$WORK/agent.toml" --data-dir "$WORK/agent" >"$WORK/agent.log" 2>&1 || true
-sleep 1.5
+echo "### 6. Run the agent (collect + forward over mTLS); poll for the verdict"
+AGENT=""
+agent_cleanup() { [ -n "$AGENT" ] && kill "$AGENT" 2>/dev/null || true; }
+"$BIN/aegis-agent" run --server "https://$TLS" --config "$WORK/agent.toml" --data-dir "$WORK/agent" >"$WORK/agent.log" 2>&1 &
+AGENT=$!
+# The server produces the agent-vs-human verdict from forwarded telemetry; poll
+# until it lands (robust to a slow/low-core box) or time out (~20s).
+DET="[]"
+for _ in $(seq 1 40); do
+  DET=$(curl -s "http://$HTTP/api/v1/detections" || echo "[]")
+  [ "$DET" != "[]" ] && break
+  sleep 0.5
+done
+agent_cleanup; wait "$AGENT" 2>/dev/null || true
 
 echo "### 7. Evidence from the operator API"
 echo "--- agents ---";     curl -s "http://$HTTP/api/v1/agents"; echo
-echo "--- detections ---"; curl -s "http://$HTTP/api/v1/detections"; echo
+echo "--- detections ---"; printf '%s\n' "$DET"
 echo "--- scores ---";     curl -s "http://$HTTP/api/v1/scores"; echo
-echo "--- alerts ---";     curl -s "http://$HTTP/api/v1/alerts"; echo
+echo "--- alerts (5) ---"; curl -s "http://$HTTP/api/v1/alerts?limit=5"; echo
+if [ "$DET" = "[]" ]; then echo "WARN: no detection within timeout"; else echo "OK: agent-vs-human verdict produced from forwarded telemetry"; fi
 
 echo "### agent log tail"
 tail -8 "$WORK/agent.log" || true
