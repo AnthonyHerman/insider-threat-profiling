@@ -197,49 +197,92 @@ fn is_root() -> bool {
     crate::is_root()
 }
 
-/// `chown(path, 0, 0)` — make a freshly created file explicitly root-owned.
+/// `fchown(fd, 0, 0)` — make the file behind an *already-open, verified* fd
+/// explicitly root-owned.
 ///
-/// The installer runs as root, so created files are already root-owned by
-/// default; this is defense in depth (and corrects ownership on a reinstall over
-/// a file some other user might have created).
-fn chown_root(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("path has interior NUL: {}", path.display()))?;
-    // SAFETY: `c` is a valid NUL-terminated C string living for the call; chown
-    // takes (path, uid, gid). Return value checked; errno surfaced on failure.
-    let rc = unsafe { libc::chown(c.as_ptr(), 0, 0) };
+/// Operating on the fd (not a path) closes the symlink/TOCTOU window that a
+/// path-based `chown` has: we chown exactly the inode we opened and wrote, never
+/// whatever a path resolves to at chown time. The installer runs as root, so
+/// created files are already root-owned; this corrects ownership on a reinstall
+/// over a file some other user might have created.
+fn fchown_root(f: &std::fs::File) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `f` owns a valid fd for the duration of the call; fchown takes
+    // (fd, uid, gid). Return value checked; errno surfaced on failure.
+    let rc = unsafe { libc::fchown(f.as_raw_fd(), 0, 0) };
     if rc == -1 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("chown root:root {}", path.display()));
+        return Err(std::io::Error::last_os_error()).context("fchown root:root");
     }
     Ok(())
 }
 
-/// Write `bytes` to `path` with `mode`, truncating any prior file, then chown
-/// root:root. Creates parent directories as needed.
+/// Open `path` for writing such that a symlink planted at the final path
+/// component cannot redirect the write (or a later chown) elsewhere.
+///
+/// Uses `O_NOFOLLOW`: if the final component is a symlink the open fails with
+/// `ELOOP` rather than following it, which defeats the "plant a symlink at the
+/// install destination" arbitrary-write/chown-to-root primitive. `O_CREAT`
+/// creates the file if absent (with `mode`); `O_TRUNC` truncates a legitimate
+/// pre-existing *regular* file for an idempotent reinstall (a symlink would have
+/// already failed the `O_NOFOLLOW` check, so truncation only ever hits a real
+/// file). `O_CLOEXEC` avoids leaking the fd across the `systemctl` execs.
+fn open_nofollow_write(path: &Path, mode: u32) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "opening {} for write (O_NOFOLLOW; a symlink at the destination is refused)",
+                path.display()
+            )
+        })
+}
+
+/// Write `bytes` to `path` with `mode`, truncating any prior regular file, then
+/// `fchown` root:root — all through one symlink-safe fd. Creates parent
+/// directories as needed.
 fn write_root_owned(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating directory {}", parent.display()))?;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(path)
-        .with_context(|| format!("opening {} for write", path.display()))?;
-    // create+mode only sets perms on creation; tighten unconditionally.
-    std::fs::set_permissions(path, PermissionsExt::from_mode(mode)).ok();
+    let mut f = open_nofollow_write(path, mode)?;
+    // create+mode only sets perms on creation; tighten the OPEN fd's inode
+    // unconditionally (covers a pre-existing file opened with looser perms).
+    f.set_permissions(PermissionsExt::from_mode(mode))
+        .with_context(|| format!("chmod {mode:o} {}", path.display()))?;
     f.write_all(bytes)
         .with_context(|| format!("writing {}", path.display()))?;
     f.flush().ok();
-    drop(f);
-    chown_root(path)?;
+    // chown the fd we wrote, not a re-resolved path.
+    fchown_root(&f).with_context(|| format!("chowning {} root:root", path.display()))?;
+    Ok(())
+}
+
+/// Copy `src` to `dst` with `mode`, root-owned, through a symlink-safe
+/// (`O_NOFOLLOW`) destination fd. Streams the source rather than slurping it, and
+/// `fchown`s the destination fd. Used for the agent binary, replacing
+/// `std::fs::copy` (which follows a symlink planted at `dst`).
+fn copy_root_owned(src: &Path, dst: &Path, mode: u32) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut input =
+        std::fs::File::open(src).with_context(|| format!("opening source {}", src.display()))?;
+    let mut out = open_nofollow_write(dst, mode)?;
+    out.set_permissions(PermissionsExt::from_mode(mode))
+        .with_context(|| format!("chmod {mode:o} {}", dst.display()))?;
+    std::io::copy(&mut input, &mut out)
+        .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
+    out.flush().ok();
+    fchown_root(&out).with_context(|| format!("chowning {} root:root", dst.display()))?;
     Ok(())
 }
 
@@ -305,19 +348,10 @@ pub fn install(spec: &InstallSpec) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating directory {}", parent.display()))?;
     }
-    std::fs::copy(&current, &install_path).with_context(|| {
-        format!(
-            "copying {} -> {}",
-            current.display(),
-            install_path.display()
-        )
-    })?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&install_path, PermissionsExt::from_mode(0o755))
-            .with_context(|| format!("chmod 0755 {}", install_path.display()))?;
-    }
-    chown_root(&install_path)?;
+    // Symlink-safe copy: open the destination O_NOFOLLOW so a symlink planted at
+    // `install_path` cannot redirect the write, stream the bytes, then fchown the
+    // fd (not the path). Replaces `std::fs::copy` (which follows a dest symlink).
+    copy_root_owned(&current, &install_path, 0o755)?;
 
     // Step 2: write the unit files (reuse the already-tested rendered text).
     // Clear any pre-existing immutable bit so a reinstall can overwrite.

@@ -52,6 +52,16 @@ pub const TOKEN_VALIDITY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 /// Number of random bytes in a token (rendered as 64 lowercase hex chars).
 const TOKEN_BYTES: usize = 32;
 
+/// Maximum accepted length (bytes) of the agent-supplied `hostname` / `os`
+/// strings at enrollment. They are stored permanently in the `agents` table
+/// (excluded from compaction), so an unbounded value from a peer would be a
+/// permanent per-record bloat. 255 covers any real hostname (RFC 1035 limit) and
+/// OS descriptor.
+pub const MAX_ENROLL_FIELD_LEN: usize = 255;
+
+/// Maximum accepted length (bytes) of the operator-facing token `label`.
+pub const MAX_TOKEN_LABEL_LEN: usize = 256;
+
 // --- Token CRUD -----------------------------------------------------------
 
 /// Mint a new one-time enrollment token with an operator-facing `label`.
@@ -59,6 +69,12 @@ const TOKEN_BYTES: usize = 32;
 /// Returns the token string (64-char lowercase hex) and the stored
 /// [`TokenRow`]. The 32 random bytes come from the OS CSPRNG.
 pub fn create_token(store: &Store, label: &str) -> anyhow::Result<(String, TokenRow)> {
+    if label.len() > MAX_TOKEN_LABEL_LEN {
+        anyhow::bail!(
+            "token label too long ({} bytes; max {MAX_TOKEN_LABEL_LEN})",
+            label.len()
+        );
+    }
     let mut raw = [0u8; TOKEN_BYTES];
     rand::rngs::OsRng.fill_bytes(&mut raw);
     let token = hex::encode(raw);
@@ -108,6 +124,15 @@ pub fn enroll(
     os: &str,
     pubkey: [u8; 32],
 ) -> anyhow::Result<EnrollOutcome> {
+    // Bound the agent-supplied descriptor strings before they are persisted
+    // permanently in the `agents` table (L2). Reject (rather than truncate) so a
+    // misbehaving/compromised endpoint gets a clear signal and the token is not
+    // burned on a malformed request.
+    if hostname.len() > MAX_ENROLL_FIELD_LEN || os.len() > MAX_ENROLL_FIELD_LEN {
+        return Ok(EnrollOutcome::Rejected {
+            reason: format!("hostname/os too long (max {MAX_ENROLL_FIELD_LEN} bytes each)"),
+        });
+    }
     let result = store.enroll_txn(token, now_ns(), TOKEN_VALIDITY_NS, hostname, os, pubkey)?;
     Ok(match result {
         Ok((agent_id, _row)) => EnrollOutcome::Accepted { agent_id },
@@ -268,6 +293,43 @@ mod tests {
             other => panic!("expected rejection, got {other:?}"),
         }
         assert_eq!(store.agents().unwrap().len(), before, "no second agent");
+    }
+
+    #[test]
+    fn create_token_rejects_overlong_label() {
+        let (_d, store) = open_tmp();
+        let long = "x".repeat(MAX_TOKEN_LABEL_LEN + 1);
+        assert!(
+            create_token(&store, &long).is_err(),
+            "over-long label must be rejected"
+        );
+        // A label at the limit is accepted.
+        let ok = "y".repeat(MAX_TOKEN_LABEL_LEN);
+        assert!(create_token(&store, &ok).is_ok());
+    }
+
+    #[test]
+    fn enroll_rejects_overlong_hostname_or_os_without_burning_token() {
+        let (_d, store) = open_tmp();
+        let (token, _) = create_token(&store, "host").unwrap();
+        let long = "h".repeat(MAX_ENROLL_FIELD_LEN + 1);
+
+        // Over-long hostname is rejected...
+        let outcome = enroll(&store, &token, &long, "Linux", [1u8; 32]).unwrap();
+        assert!(matches!(outcome, EnrollOutcome::Rejected { .. }));
+        // ...and the token is NOT burned (the request was malformed, not used).
+        assert!(store.agents().unwrap().is_empty(), "no agent created");
+        let still_unused = list_tokens(&store)
+            .unwrap()
+            .into_iter()
+            .find(|(t, _)| *t == token)
+            .map(|(_, r)| !r.used)
+            .unwrap_or(false);
+        assert!(still_unused, "token must remain reusable after a rejection");
+
+        // The same token then enrolls fine with sane fields.
+        let ok = enroll(&store, &token, "host-a", "Linux", [1u8; 32]).unwrap();
+        assert!(matches!(ok, EnrollOutcome::Accepted { .. }));
     }
 
     #[test]

@@ -30,7 +30,9 @@ pub struct ScoringConfig {
     pub agent_detection_weight: f64,
     /// Risk added per suspicious process exec.
     pub process_weight: f64,
-    /// Multiplicative decay applied to a subject's score on each update.
+    /// Multiplicative decay applied to a subject's score on each update. Must
+    /// be in `(0.0, 1.0]`: `> 1.0` would grow scores without evidence and
+    /// `< 0.0` would zero accumulated risk (validated in `init`).
     pub decay: f64,
     /// Score at/above which an alert fires.
     pub alert_threshold: f64,
@@ -62,6 +64,12 @@ impl Default for ScoringConfig {
     }
 }
 
+/// Scores at or below this are treated as negligible and the entry is evicted,
+/// so a subject that has decayed back to ~zero does not occupy the map forever.
+/// (`get` returns 0.0 for an absent subject, so eviction is observationally
+/// identical to a stored ~zero score.)
+const NEGLIGIBLE_SCORE: f64 = 0.01;
+
 /// Pure risk-accumulation state, separated from I/O for testability.
 #[derive(Debug, Default, Clone)]
 pub struct RiskState {
@@ -70,14 +78,36 @@ pub struct RiskState {
 
 impl RiskState {
     /// Apply decay then add `delta`, clamping to [0, 100]. Returns the new score.
+    ///
+    /// Once a subject's score decays to a negligible value it is **evicted** so
+    /// the map cannot grow without bound across many short-lived subjects.
     pub fn bump(&mut self, subject: &str, delta: f64, decay: f64) -> f64 {
         let entry = self.scores.entry(subject.to_string()).or_insert(0.0);
         *entry = (*entry * decay + delta).clamp(0.0, 100.0);
-        *entry
+        let new_score = *entry;
+        if new_score <= NEGLIGIBLE_SCORE {
+            self.scores.remove(subject);
+        }
+        new_score
     }
 
     pub fn get(&self, subject: &str) -> f64 {
         self.scores.get(subject).copied().unwrap_or(0.0)
+    }
+
+    /// Drop a subject's accumulated score entirely (e.g. when its session ends).
+    pub fn remove(&mut self, subject: &str) {
+        self.scores.remove(subject);
+    }
+
+    /// Number of tracked subjects (for tests/observability).
+    pub fn len(&self) -> usize {
+        self.scores.len()
+    }
+
+    /// Whether any subject is currently tracked.
+    pub fn is_empty(&self) -> bool {
+        self.scores.is_empty()
     }
 }
 
@@ -107,15 +137,32 @@ impl Plugin for ScoringPlugin {
     }
 
     fn subscriptions(&self) -> Subscriptions {
-        Subscriptions::kinds(["detection", "process.exec", "alert"])
+        Subscriptions::kinds(["detection", "process.exec", "alert", "session.end"])
     }
 
     async fn init(&mut self, ctx: &PluginContext) -> anyhow::Result<()> {
         self.config = ctx.config_as()?;
+        // `decay` is a multiplicative retention factor in (0, 1]: each update
+        // multiplies the prior score by it. A `decay > 1.0` grows scores without
+        // new evidence; a `decay < 0.0` zeroes accumulated risk (via the clamp
+        // in `bump`). Reject out-of-range values up front.
+        let decay = self.config.decay;
+        if !(decay > 0.0 && decay <= 1.0) {
+            anyhow::bail!("decay must be in (0.0, 1.0], got {decay}");
+        }
         Ok(())
     }
 
     async fn handle(&self, event: &Event, ctx: &PluginContext) -> anyhow::Result<()> {
+        // When a session ends, drop its accumulated risk so session-keyed
+        // subjects do not linger in the map (mirrors plugin-agent-detect's own
+        // session cleanup). `uid:<N>` subjects are not session-scoped and rely
+        // on the negligible-score eviction in `RiskState::bump` instead.
+        if let EventPayload::SessionEnd { session_id } = &event.payload {
+            self.state.lock().await.remove(session_id);
+            return Ok(());
+        }
+
         // (subject, risk delta, optional [confidence, agentness] for the Score
         // feature decomposition — present only for Detection-sourced bumps).
         let (subject, delta, source): (String, f64, Option<(f64, f64)>) = match &event.payload {
@@ -227,6 +274,128 @@ register_plugin!("plugin-scoring", || Box::new(ScoringPlugin::default()));
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aegis_sdk::Emitter;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct CapturingEmitter {
+        events: Arc<StdMutex<Vec<Event>>>,
+    }
+    #[async_trait]
+    impl Emitter for CapturingEmitter {
+        async fn emit(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+    fn test_ctx(emitter: Arc<CapturingEmitter>) -> PluginContext {
+        PluginContext {
+            agent_id: "test-agent".into(),
+            data_dir: std::env::temp_dir(),
+            config: serde_json::Value::Null,
+            emitter,
+        }
+    }
+
+    /// L10: a subject whose score decays to a negligible value is evicted from
+    /// the map, so many short-lived subjects cannot grow `scores` without bound.
+    #[test]
+    fn negligible_scores_are_evicted() {
+        let mut s = RiskState::default();
+        // Push to a small score, then let it decay below the negligible floor.
+        s.bump("ephemeral", 0.5, 0.98);
+        assert_eq!(s.len(), 1);
+        // Pure-decay steps with no new evidence drive it under NEGLIGIBLE_SCORE.
+        for _ in 0..400 {
+            s.bump("ephemeral", 0.0, 0.5);
+        }
+        assert_eq!(s.get("ephemeral"), 0.0);
+        assert!(s.is_empty(), "decayed subject should be evicted");
+    }
+
+    /// L10: explicit `remove` drops a subject entirely.
+    #[test]
+    fn remove_drops_subject() {
+        let mut s = RiskState::default();
+        s.bump("sess-1", 50.0, 0.98);
+        assert_eq!(s.len(), 1);
+        s.remove("sess-1");
+        assert!(s.is_empty());
+        assert_eq!(s.get("sess-1"), 0.0);
+    }
+
+    /// L10: a `SessionEnd` event clears the matching session-keyed subject so it
+    /// does not linger in the map after the session is gone.
+    #[tokio::test]
+    async fn session_end_clears_session_subject() {
+        let emitter = Arc::new(CapturingEmitter::default());
+        let ctx = test_ctx(emitter.clone());
+        let plugin = ScoringPlugin::default();
+
+        // An Agent detection for session "s-42" accrues risk under that subject.
+        plugin
+            .handle(
+                &Event::new(
+                    "test-agent",
+                    "test",
+                    EventPayload::Detection {
+                        subject: "s-42".into(),
+                        verdict: Verdict::Agent,
+                        confidence: 0.9,
+                        model: "m".into(),
+                        reasons: vec![],
+                        features: BTreeMap::new(),
+                    },
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(plugin.state.lock().await.get("s-42") > 0.0);
+
+        // Ending the session evicts the subject.
+        plugin
+            .handle(
+                &Event::new(
+                    "test-agent",
+                    "test",
+                    EventPayload::SessionEnd {
+                        session_id: "s-42".into(),
+                    },
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plugin.state.lock().await.get("s-42"), 0.0);
+        assert!(plugin.state.lock().await.is_empty());
+    }
+
+    /// L9: `init` rejects an out-of-range `decay` (> 1.0 grows scores without
+    /// evidence; < 0.0 zeroes accumulated risk); a valid decay is accepted.
+    #[tokio::test]
+    async fn init_rejects_out_of_range_decay() {
+        let mut plugin = ScoringPlugin::default();
+        let bad = test_ctx(Arc::new(CapturingEmitter::default()));
+        let bad = PluginContext {
+            config: serde_json::json!({
+                "agent_detection_weight": 60.0, "process_weight": 5.0,
+                "decay": 1.5, "alert_threshold": 75.0
+            }),
+            ..bad
+        };
+        assert!(plugin.init(&bad).await.is_err());
+
+        let mut plugin_ok = ScoringPlugin::default();
+        let good = test_ctx(Arc::new(CapturingEmitter::default()));
+        let good = PluginContext {
+            config: serde_json::json!({
+                "agent_detection_weight": 60.0, "process_weight": 5.0,
+                "decay": 0.98, "alert_threshold": 75.0
+            }),
+            ..good
+        };
+        assert!(plugin_ok.init(&good).await.is_ok());
+    }
 
     #[test]
     fn risk_decays_and_clamps() {

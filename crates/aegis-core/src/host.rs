@@ -1,12 +1,13 @@
 //! The plugin host: discovery, lifecycle, and the dispatch runtime.
 
-use crate::bus::ingress;
+use crate::bus::{ingress, ScopedEmitter};
 use crate::config::HostConfig;
 use crate::loader;
 use aegis_sdk::{
     Emitter, Event, Plugin, PluginContext, PluginRegistration, Subscriptions, PLUGIN_API_VERSION,
 };
 use anyhow::Context;
+use futures::FutureExt;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -65,18 +66,61 @@ impl HostBuilder {
             }
         }
 
-        // 2. Dynamic plugins from configured shared-object paths.
-        for path in &config.dynamic_plugins {
-            let dynamic = loader::load_dynamic(path)
-                .with_context(|| format!("loading dynamic plugin {}", path.display()))?;
-            let plugin = (dynamic.constructor)();
-            let name = plugin.metadata().name.to_string();
+        // 2. Dynamic plugins from configured shared-object declarations.
+        //
+        // Loading a shared object *executes code* (its `aegis_plugin_entry`), so
+        // enablement is evaluated from the declared `name` **before** the library
+        // is ever opened: a disabled-but-listed path is never `dlopen`ed. After
+        // load we assert the library-reported metadata name matches the declared
+        // name and reject a mismatch (so a swapped `.so` can't impersonate an
+        // enabled plugin name).
+        for spec in &config.dynamic_plugins {
+            if !config.is_enabled(&spec.name) || seen.contains(&spec.name) {
+                tracing::debug!(
+                    plugin = %spec.name,
+                    path = %spec.path.display(),
+                    "skipping dynamic plugin (disabled or already loaded); not opening library"
+                );
+                continue;
+            }
+            let dynamic = loader::load_dynamic(&spec.path)
+                .with_context(|| format!("loading dynamic plugin {}", spec.path.display()))?;
+            // Construct the plugin, containing any panic so one bad plugin does
+            // not unwind the whole build.
+            let plugin =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(dynamic.constructor)) {
+                    Ok(plugin) => plugin,
+                    Err(_) => {
+                        tracing::warn!(
+                            plugin = %spec.name,
+                            path = %spec.path.display(),
+                            "dynamic plugin constructor panicked; skipping"
+                        );
+                        // Keep the library mapped even on failure: code/strings from
+                        // it may still be referenced while we unwind logging, and the
+                        // host owns the lifetime for the program's duration.
+                        libs.push(dynamic.library);
+                        continue;
+                    }
+                };
+            let actual = plugin.metadata().name.to_string();
             // Keep the library mapped regardless; the host owns its lifetime.
             libs.push(dynamic.library);
-            if config.is_enabled(&name) && seen.insert(name.clone()) {
-                tracing::info!(plugin = %name, path = %path.display(), "loaded dynamic plugin");
-                loaded.push(LoadedPlugin { name, plugin });
+            if actual != spec.name {
+                tracing::warn!(
+                    expected = %spec.name,
+                    found = %actual,
+                    path = %spec.path.display(),
+                    "dynamic plugin metadata name does not match its declared name; rejecting"
+                );
+                continue;
             }
+            tracing::info!(plugin = %spec.name, path = %spec.path.display(), "loaded dynamic plugin");
+            seen.insert(spec.name.clone());
+            loaded.push(LoadedPlugin {
+                name: spec.name.clone(),
+                plugin,
+            });
         }
 
         // 3. Statically-registered built-in plugins (via inventory).
@@ -93,11 +137,19 @@ impl HostBuilder {
                 }
                 let name = reg.name.to_string();
                 if config.is_enabled(&name) && !seen.contains(&name) {
-                    seen.insert(name.clone());
-                    loaded.push(LoadedPlugin {
-                        name,
-                        plugin: (reg.constructor)(),
-                    });
+                    // Contain a panicking constructor rather than aborting build.
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(reg.constructor)) {
+                        Ok(plugin) => {
+                            seen.insert(name.clone());
+                            loaded.push(LoadedPlugin { name, plugin });
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                plugin = %name,
+                                "statically-registered plugin constructor panicked; skipping"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -147,6 +199,7 @@ impl Host {
         } = self;
 
         let (emitter, mut ingress_rx) = ingress(config.queue_depth);
+        let bus_metrics = emitter.metrics();
         let emitter_arc: Arc<dyn Emitter> = Arc::new(emitter);
         let (shutdown_tx, _) = watch::channel(false);
 
@@ -159,17 +212,39 @@ impl Host {
             if let Err(err) = std::fs::create_dir_all(&data_dir) {
                 tracing::warn!(plugin = %name, error = %err, "could not create plugin data dir");
             }
+            // Hand each plugin a per-plugin emitter that stamps `source` with
+            // this plugin's name and pins `agent_id` to the host identity, so a
+            // plugin cannot spoof another plugin's name or forge `agent_id`.
+            let scoped_emitter: Arc<dyn Emitter> = Arc::new(ScopedEmitter::new(
+                emitter_arc.clone(),
+                name.clone(),
+                config.agent_id.clone(),
+            ));
             let ctx = Arc::new(PluginContext {
                 agent_id: config.agent_id.clone(),
                 data_dir,
                 config: config.plugin_config(&name),
-                emitter: emitter_arc.clone(),
+                emitter: scoped_emitter,
             });
 
-            plugin
-                .init(&ctx)
-                .await
-                .with_context(|| format!("initializing plugin `{name}`"))?;
+            // Isolate init: a plugin that fails or *panics* during init is logged
+            // and skipped, rather than aborting `run` for every other plugin.
+            // `catch_unwind` on the future contains an async panic; the `Result`
+            // arm contains an ordinary init error.
+            let init_outcome = std::panic::AssertUnwindSafe(plugin.init(&ctx))
+                .catch_unwind()
+                .await;
+            match init_outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(plugin = %name, error = %err, "plugin init failed; skipping");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(plugin = %name, "plugin init panicked; skipping");
+                    continue;
+                }
+            }
 
             let subscriptions = plugin.subscriptions();
             let plugin: Arc<dyn Plugin> = Arc::from(plugin);
@@ -210,19 +285,32 @@ impl Host {
 
         // The dispatcher fans ingress events out to subscribed plugin queues.
         let mut shutdown_rx = shutdown_tx.subscribe();
+        let dispatcher_metrics = bus_metrics.clone();
         let dispatcher = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     maybe_event = ingress_rx.recv() => {
                         match maybe_event {
                             Some(event) => {
+                                let critical = crate::bus::is_critical_kind(&event.kind);
                                 for (subs, tx) in &routes {
-                                    if subs.matches(&event.kind) {
-                                        if let Err(mpsc::error::TrySendError::Full(ev)) =
-                                            tx.try_send(event.clone())
-                                        {
-                                            tracing::warn!(kind = %ev.kind, "plugin queue full; dropping event");
+                                    if !subs.matches(&event.kind) {
+                                        continue;
+                                    }
+                                    if critical {
+                                        // Non-droppable: await a slot on this
+                                        // plugin's queue so a flood of cheap
+                                        // telemetry cannot evict an alert/
+                                        // detection/score. A closed queue means
+                                        // that plugin's task has stopped.
+                                        if let Err(err) = tx.send(event.clone()).await {
+                                            tracing::warn!(kind = %event.kind, error = %err, "plugin queue closed; dropping critical event");
                                         }
+                                    } else if let Err(mpsc::error::TrySendError::Full(ev)) =
+                                        tx.try_send(event.clone())
+                                    {
+                                        dispatcher_metrics.record_fanout_full();
+                                        tracing::warn!(kind = %ev.kind, "plugin queue full; dropping event");
                                     }
                                 }
                             }
@@ -238,6 +326,7 @@ impl Host {
 
         Ok(RunningHost {
             emitter: emitter_arc,
+            metrics: bus_metrics,
             shutdown_tx,
             dispatcher: Some(dispatcher),
             handlers,
@@ -257,6 +346,7 @@ struct PluginEntry {
 /// [`RunningHost::shutdown`] for a graceful stop.
 pub struct RunningHost {
     emitter: Arc<dyn Emitter>,
+    metrics: Arc<crate::bus::BusMetrics>,
     shutdown_tx: watch::Sender<bool>,
     dispatcher: Option<JoinHandle<()>>,
     handlers: Vec<JoinHandle<()>>,
@@ -269,6 +359,12 @@ impl RunningHost {
     /// A cloneable emitter for feeding external events (e.g. network ingest).
     pub fn emitter(&self) -> Arc<dyn Emitter> {
         self.emitter.clone()
+    }
+
+    /// Observable bus drop counters (ingress + fan-out), so event loss is
+    /// alertable rather than silent.
+    pub fn bus_metrics(&self) -> Arc<crate::bus::BusMetrics> {
+        self.metrics.clone()
     }
 
     /// Publish an event onto the bus.
@@ -285,10 +381,15 @@ impl RunningHost {
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
         let _ = self.shutdown_tx.send(true);
         if let Some(dispatcher) = self.dispatcher.take() {
-            let _ = dispatcher.await;
+            if let Err(err) = dispatcher.await {
+                // Surface a panicked/cancelled dispatcher instead of swallowing it.
+                tracing::warn!(error = %err, "dispatcher task did not exit cleanly");
+            }
         }
         for handle in self.handlers.drain(..) {
-            let _ = handle.await;
+            if let Err(err) = handle.await {
+                tracing::warn!(error = %err, "plugin handler task did not exit cleanly");
+            }
         }
         for entry in &self.entries {
             if let Err(err) = entry.plugin.shutdown().await {
@@ -322,6 +423,61 @@ mod tests {
         async fn handle(&self, _event: &Event, _ctx: &PluginContext) -> anyhow::Result<()> {
             self.seen.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    /// H6 regression: a *disabled* dynamic plugin must never have its shared
+    /// object opened (opening executes code). We point the spec at a path that
+    /// does not exist: if `build` opened the library before checking enablement,
+    /// `load_dynamic` would fail and `build` would return `Err`. Because the
+    /// plugin is disabled, the path is never touched and `build` succeeds.
+    #[test]
+    fn disabled_dynamic_plugin_is_not_opened() {
+        use crate::config::DynamicPluginSpec;
+        use std::path::PathBuf;
+
+        let mut config = HostConfig::new("test-agent");
+        config.data_dir = std::env::temp_dir().join("aegis-test-data-h6");
+        // A path that definitely cannot be dlopened.
+        config.dynamic_plugins = vec![DynamicPluginSpec {
+            name: "ghost-plugin".to_string(),
+            path: PathBuf::from("/nonexistent/aegis-ghost-plugin.so"),
+        }];
+        // Disable it: build must not open the (missing) library.
+        config.disabled_plugins = vec!["ghost-plugin".to_string()];
+
+        let host = HostBuilder::new(config)
+            .discover_static(false)
+            .build()
+            .expect("build must succeed without opening a disabled dynamic plugin");
+        assert!(
+            host.plugin_names().is_empty(),
+            "no plugins should be loaded"
+        );
+    }
+
+    /// Conversely, an *enabled* dynamic plugin whose library is missing must
+    /// surface a load error — proving the enablement gate is what suppresses the
+    /// open in the disabled case (and that an enabled entry genuinely opens).
+    #[test]
+    fn enabled_missing_dynamic_plugin_errors() {
+        use crate::config::DynamicPluginSpec;
+        use std::path::PathBuf;
+
+        let mut config = HostConfig::new("test-agent");
+        config.data_dir = std::env::temp_dir().join("aegis-test-data-h6b");
+        config.dynamic_plugins = vec![DynamicPluginSpec {
+            name: "ghost-plugin".to_string(),
+            path: PathBuf::from("/nonexistent/aegis-ghost-plugin.so"),
+        }];
+        // Enabled (default enabled_plugins = None ⇒ all enabled).
+        let result = HostBuilder::new(config).discover_static(false).build();
+        match result {
+            Ok(_) => panic!("an enabled but missing dynamic plugin must error"),
+            Err(err) => assert!(
+                err.to_string().contains("loading dynamic plugin"),
+                "unexpected error: {err}"
+            ),
         }
     }
 

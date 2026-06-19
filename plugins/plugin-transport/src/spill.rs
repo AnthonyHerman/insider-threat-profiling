@@ -32,6 +32,45 @@ use aegis_sdk::Event;
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
+/// Create `path`'s parent directory `0700` and pre-create the (empty) DB file
+/// `0600` so redb opens an already-restricted file rather than creating one under
+/// the process umask (which is typically world-readable). The spill holds
+/// plaintext telemetry about the monitored user, so it must not be readable by
+/// other local unprivileged users.
+fn secure_db_path(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent() {
+        // An empty parent (relative bare filename) needs no dir creation.
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating spill dir {}", parent.display()))?;
+            // Tighten even if the dir pre-existed with looser perms.
+            std::fs::set_permissions(parent, PermissionsExt::from_mode(0o700)).ok();
+        }
+    }
+    // Pre-create the backing file 0600 if it does not already exist. `create_new`
+    // is a no-op-with-error when the file exists (a recovered spill); in that case
+    // we still tighten its mode below.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("pre-creating spill file {}", path.display()))
+        }
+    }
+    // Enforce 0600 on the data file unconditionally (covers a recovered file that
+    // pre-existed with looser perms). redb sidecar/lock files live in the same
+    // 0700 directory, so directory protection covers them.
+    std::fs::set_permissions(path, PermissionsExt::from_mode(0o600)).ok();
+    Ok(())
+}
+
 /// `seq (u64) -> json(Event)`.
 const SPILL: TableDefinition<u64, &[u8]> = TableDefinition::new("spill");
 
@@ -53,6 +92,11 @@ pub struct Spill {
     /// Total encoded payload bytes currently retained (approximate on-disk
     /// footprint; excludes redb's own per-row overhead).
     bytes: u64,
+    /// Hard cap on retained payload bytes. [`push`](Self::push) enforces this
+    /// automatically (drop-oldest) so no call site can forget the cap and let the
+    /// spill grow without bound while the server is unreachable. `u64::MAX`
+    /// effectively disables the cap.
+    max_bytes: u64,
     /// Lifetime count of events dropped by [`enforce_cap`].
     dropped: AtomicU64,
 }
@@ -67,7 +111,19 @@ pub struct SpilledEvent {
 impl Spill {
     /// Open (creating if absent) the spill database at `path`, recovering cursors
     /// and the retained-byte total from any existing contents.
-    pub fn open(path: &Path) -> Result<Self> {
+    ///
+    /// `max_bytes` is the hard on-disk retention cap enforced automatically by
+    /// [`push`](Self::push) (drop-oldest). Pass `u64::MAX` to disable the cap.
+    /// The backing file and its parent directory are created with restrictive
+    /// permissions (file `0600`, dir `0700`) so buffered plaintext telemetry
+    /// about other users is not world-readable.
+    pub fn open(path: &Path, max_bytes: u64) -> Result<Self> {
+        // Create the parent directory 0700 and pre-create the DB file 0600 BEFORE
+        // redb opens it, so the spill (and its sidecar/lock files, which inherit
+        // the dir's protection) are never momentarily world-readable under the
+        // umask. Mirrors the identity-file discipline in `identity.rs`.
+        secure_db_path(path).with_context(|| format!("securing spill path {}", path.display()))?;
+
         let db = Database::create(path)
             .with_context(|| format!("opening spill db {}", path.display()))?;
 
@@ -99,6 +155,7 @@ impl Spill {
             db,
             write_cursor,
             bytes,
+            max_bytes,
             dropped: AtomicU64::new(0),
         })
     }
@@ -131,6 +188,11 @@ impl Spill {
     }
 
     /// Append events to the tail of the spill. Each gets the next sequence number.
+    ///
+    /// The configured byte cap is enforced here (drop-oldest) after the append, so
+    /// every producer — the hot flush path, the shutdown drain, and the pre-enroll
+    /// buffer — honors `max_bytes` without remembering to call [`enforce_cap`]
+    /// itself. This is what bounds on-disk growth when the server is unreachable.
     pub fn push(&mut self, events: &[Event]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -148,6 +210,9 @@ impl Spill {
         }
         wtxn.commit()?;
         self.bytes += added_bytes;
+        // Enforce the retention cap centrally so it can never be forgotten at a
+        // call site (the original bug: the ring drained into the spill forever).
+        self.enforce_cap(self.max_bytes)?;
         Ok(())
     }
 
@@ -275,7 +340,7 @@ mod tests {
     #[test]
     fn push_then_drain_is_fifo() {
         let path = tmp_db("fifo");
-        let mut s = Spill::open(&path).unwrap();
+        let mut s = Spill::open(&path, u64::MAX).unwrap();
         s.push(&[ev(1), ev(2), ev(3)]).unwrap();
         assert_eq!(s.len().unwrap(), 3);
 
@@ -294,7 +359,7 @@ mod tests {
     #[test]
     fn ack_through_removes_prefix() {
         let path = tmp_db("ack");
-        let mut s = Spill::open(&path).unwrap();
+        let mut s = Spill::open(&path, u64::MAX).unwrap();
         s.push(&[ev(1), ev(2), ev(3), ev(4)]).unwrap();
         // Ack the first two (seq 0,1).
         let removed = s.ack_through(1).unwrap();
@@ -309,11 +374,11 @@ mod tests {
     fn restart_recovers_cursor_and_appends_after() {
         let path = tmp_db("restart");
         {
-            let mut s = Spill::open(&path).unwrap();
+            let mut s = Spill::open(&path, u64::MAX).unwrap();
             s.push(&[ev(1), ev(2), ev(3)]).unwrap();
             // drop closes the db
         }
-        let mut s = Spill::open(&path).unwrap();
+        let mut s = Spill::open(&path, u64::MAX).unwrap();
         assert_eq!(s.len().unwrap(), 3, "data survived restart");
         // New push must continue the sequence, not collide with seq 0..=2.
         s.push(&[ev(4)]).unwrap();
@@ -329,11 +394,11 @@ mod tests {
         // cause the next run to reuse a sequence number.
         let path = tmp_db("restart-ack");
         {
-            let mut s = Spill::open(&path).unwrap();
+            let mut s = Spill::open(&path, u64::MAX).unwrap();
             s.push(&[ev(1), ev(2), ev(3)]).unwrap();
             s.ack_through(1).unwrap(); // remove seq 0,1; max key now 2
         }
-        let mut s = Spill::open(&path).unwrap();
+        let mut s = Spill::open(&path, u64::MAX).unwrap();
         s.push(&[ev(9)]).unwrap();
         let all = s.drain_batch(10, u64::MAX).unwrap();
         // Remaining seq 2, then the new one at seq 3.
@@ -344,7 +409,7 @@ mod tests {
     #[test]
     fn enforce_cap_drops_oldest_and_counts() {
         let path = tmp_db("cap");
-        let mut s = Spill::open(&path).unwrap();
+        let mut s = Spill::open(&path, u64::MAX).unwrap();
         // Encode one event to learn its size, then size a cap that holds ~2.
         let one = encode(&ev(0)).unwrap().len() as u64;
         s.push(&[ev(1), ev(2), ev(3), ev(4)]).unwrap();
@@ -366,7 +431,7 @@ mod tests {
     #[test]
     fn drain_batch_respects_byte_budget() {
         let path = tmp_db("budget");
-        let mut s = Spill::open(&path).unwrap();
+        let mut s = Spill::open(&path, u64::MAX).unwrap();
         let one = encode(&ev(0)).unwrap().len() as u64;
         s.push(&[ev(1), ev(2), ev(3), ev(4), ev(5)]).unwrap();
         // Budget for ~2 events.
@@ -378,11 +443,74 @@ mod tests {
     #[test]
     fn drain_returns_at_least_one_even_if_oversized() {
         let path = tmp_db("oversized");
-        let mut s = Spill::open(&path).unwrap();
+        let mut s = Spill::open(&path, u64::MAX).unwrap();
         s.push(&[ev(1)]).unwrap();
         // Byte budget of 0 still yields the single present event.
         let batch = s.drain_batch(100, 0).unwrap();
         assert_eq!(batch.len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// H1 regression: `push` must enforce the configured cap automatically, so a
+    /// caller that only ever calls `push` (never `enforce_cap`) still cannot grow
+    /// the spill without bound. Opening with a 2-event cap and pushing many events
+    /// must leave the retained bytes within the cap and survivors as the newest.
+    #[test]
+    fn push_enforces_cap_automatically() {
+        let one = encode(&ev(0)).unwrap().len() as u64;
+        let cap = one * 2;
+        let path = tmp_db("auto-cap");
+        let mut s = Spill::open(&path, cap).unwrap();
+
+        // Push well past the cap, in several separate pushes (each must re-cap).
+        for i in 1..=10u64 {
+            s.push(&[ev(i)]).unwrap();
+        }
+        assert!(
+            s.bytes() <= cap,
+            "push must hold retained bytes within the cap: {} > {cap}",
+            s.bytes()
+        );
+        assert!(s.dropped() >= 1, "old events must have been dropped");
+
+        // Survivors are the newest events (drop-oldest): the last pushed (uptime
+        // 10) must still be present.
+        let remaining = s.drain_batch(100, u64::MAX).unwrap();
+        let last_uptime = match remaining.last().unwrap().event.payload {
+            EventPayload::Heartbeat { uptime_s } => uptime_s,
+            _ => panic!("wrong payload"),
+        };
+        assert_eq!(last_uptime, 10, "newest event must survive drop-oldest");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A batch larger than the cap in a single `push` is still capped afterward
+    /// (the cap is enforced post-append, so the transaction stays atomic).
+    #[test]
+    fn push_caps_even_a_single_oversized_batch() {
+        let one = encode(&ev(0)).unwrap().len() as u64;
+        let cap = one * 2;
+        let path = tmp_db("auto-cap-batch");
+        let mut s = Spill::open(&path, cap).unwrap();
+        s.push(&[ev(1), ev(2), ev(3), ev(4), ev(5)]).unwrap();
+        assert!(s.bytes() <= cap, "single oversized batch must be capped");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// H2 regression: the spill DB file is created mode 0600 and its parent
+    /// directory 0700, so buffered plaintext telemetry is not world-readable.
+    #[test]
+    fn spill_file_and_dir_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_db("perms");
+        let _s = Spill::open(&path, u64::MAX).unwrap();
+
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "spill.redb must be 0600");
+
+        let dir = path.parent().unwrap();
+        let dir_mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "spill dir must be 0700");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -313,6 +313,8 @@ pub fn router(state: AppState) -> AxumRouter {
 /// client does not).
 #[derive(Debug)]
 enum ApiError {
+    /// 400 — the request body failed validation (e.g. an over-long token label).
+    BadRequest(String),
     /// 404 — the addressed resource (agent, alert) does not exist, or the target
     /// agent is not connected.
     NotFound(String),
@@ -351,6 +353,7 @@ impl From<RouterError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
+            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
@@ -528,6 +531,14 @@ async fn create_token(
     State(st): State<AppState>,
     Json(body): Json<CreateToken>,
 ) -> Result<Response, ApiError> {
+    // Bound the operator-facing label (L2) and surface a clean 400 rather than a
+    // 500 from the store layer.
+    if body.label.len() > enroll::MAX_TOKEN_LABEL_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "label too long (max {} bytes)",
+            enroll::MAX_TOKEN_LABEL_LEN
+        )));
+    }
     let (token, row) = enroll::create_token(&st.store, &body.label)?;
     let payload = json!({
         "token": token,

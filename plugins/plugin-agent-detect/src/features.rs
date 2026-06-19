@@ -39,6 +39,24 @@ pub const MIN_COMMANDS_ROBUST: usize = 16;
 /// strong agent signature regardless of how other moments are faked.
 const REACTION_FLOOR_MS: f64 = 150.0;
 
+/// Rolling-window cap on each per-session raw sample `Vec`. A session that never
+/// ends (or a hostile stream of keystroke/command events) must not grow these
+/// buffers without bound. We keep the most-recent `SAMPLE_CAP` samples (drop the
+/// oldest), which both bounds memory and keeps the statistics representative of
+/// recent behavior — and bounds the `percentile()` sort/clone cost. The
+/// monotonic counters (`keystrokes`, `commands`, …) are unaffected.
+const SAMPLE_CAP: usize = 2048;
+
+/// Push `v` onto a bounded sample buffer, evicting the oldest sample once the
+/// buffer is at `SAMPLE_CAP` (rolling window).
+#[inline]
+fn push_capped(buf: &mut Vec<f64>, v: f64) {
+    if buf.len() >= SAMPLE_CAP {
+        buf.remove(0);
+    }
+    buf.push(v);
+}
+
 /// Per-session accumulator of raw behavioral observations.
 #[derive(Debug, Default, Clone)]
 pub struct SessionAccumulator {
@@ -77,7 +95,7 @@ impl SessionAccumulator {
         // Ignore the very first keystroke's gap (no predecessor) and absurd gaps.
         let ms = inter_arrival_ns as f64 / 1.0e6;
         if ms > 0.0 && ms < 60_000.0 {
-            self.inter_arrivals_ms.push(ms);
+            push_capped(&mut self.inter_arrivals_ms, ms);
         }
     }
 
@@ -86,7 +104,7 @@ impl SessionAccumulator {
         if had_backspace {
             self.backspace_commands += 1;
         }
-        self.entropies.push(entropy);
+        push_capped(&mut self.entropies, entropy);
 
         let was_paste = self.pending_command_is_paste;
         if was_paste {
@@ -106,7 +124,7 @@ impl SessionAccumulator {
         // only non-positive and >=1h gaps — sub-150 ms gaps must be retained so
         // the tail/autocorr/decay statistics see the genuine distribution).
         if ms > 0.0 && ms < 3_600_000.0 {
-            self.inter_commands_ms.push(ms);
+            push_capped(&mut self.inter_commands_ms, ms);
         }
     }
 
@@ -402,20 +420,34 @@ impl FeatureVector {
     /// Flatten to a labelled map for inclusion in a [`Detection`] event. Emits
     /// every feature (old and new) so the dashboard/analyst sees the full,
     /// evasion-robust evidence behind a verdict.
+    ///
+    /// Non-finite values (`NaN`/`±inf`) are **skipped** rather than inserted.
+    /// The Tier-3 features carry `NaN` below the robust gate (the "no evidence"
+    /// sentinel the model renormalizes over); leaving the key out preserves that
+    /// "no evidence" meaning while keeping the resulting `Detection.features`
+    /// map JSON-serializable. `serde_json` cannot serialize `NaN`, so a single
+    /// `NaN` here would make the whole `Detection` event fail to serialize on
+    /// the server and be silently dropped from both the audit log and the
+    /// detection store — so a short session must never leak a `NaN` into the map.
     pub fn to_map(&self) -> BTreeMap<String, f64> {
         let mut m = BTreeMap::new();
-        m.insert("keystroke_cv".into(), self.keystroke_cv);
-        m.insert("paste_ratio".into(), self.paste_ratio);
-        m.insert("mean_inter_command_ms".into(), self.mean_inter_command_ms);
-        m.insert("backspace_ratio".into(), self.backspace_ratio);
-        m.insert("entropy_mean".into(), self.entropy_mean);
-        m.insert("cadence_regularity".into(), self.cadence_regularity);
-        m.insert("gap_autocorr".into(), self.gap_autocorr);
-        m.insert("think_tail_ratio".into(), self.think_tail_ratio);
-        m.insert("throughput_decay".into(), self.throughput_decay);
-        m.insert("reaction_floor_hits".into(), self.reaction_floor_hits);
-        m.insert("whole_line_paste_ratio".into(), self.whole_line_paste_ratio);
-        m.insert("keystroke_burst_cv".into(), self.keystroke_burst_cv);
+        let mut put = |k: &str, v: f64| {
+            if v.is_finite() {
+                m.insert(k.to_string(), v);
+            }
+        };
+        put("keystroke_cv", self.keystroke_cv);
+        put("paste_ratio", self.paste_ratio);
+        put("mean_inter_command_ms", self.mean_inter_command_ms);
+        put("backspace_ratio", self.backspace_ratio);
+        put("entropy_mean", self.entropy_mean);
+        put("cadence_regularity", self.cadence_regularity);
+        put("gap_autocorr", self.gap_autocorr);
+        put("think_tail_ratio", self.think_tail_ratio);
+        put("throughput_decay", self.throughput_decay);
+        put("reaction_floor_hits", self.reaction_floor_hits);
+        put("whole_line_paste_ratio", self.whole_line_paste_ratio);
+        put("keystroke_burst_cv", self.keystroke_burst_cv);
         m
     }
 }
@@ -437,6 +469,26 @@ mod tests {
             acc.record_command(2_000_000_000, true, 3.5);
         }
         assert!(acc.features().is_some());
+    }
+
+    /// H3 regression: per-session sample buffers are bounded by a rolling
+    /// window, so a never-ending session cannot grow them without bound.
+    #[test]
+    fn sample_buffers_are_bounded() {
+        let mut acc = SessionAccumulator::default();
+        // Far more events than the cap.
+        for _ in 0..(SAMPLE_CAP * 3) {
+            acc.record_keystroke(150_000_000, false, 1);
+            acc.record_command(2_000_000_000, false, 3.5);
+        }
+        assert!(acc.inter_arrivals_ms.len() <= SAMPLE_CAP);
+        assert!(acc.inter_commands_ms.len() <= SAMPLE_CAP);
+        assert!(acc.entropies.len() <= SAMPLE_CAP);
+        // Monotonic counters still reflect the true totals (not capped).
+        assert_eq!(acc.commands, (SAMPLE_CAP * 3) as u64);
+        // Features still compute (and serialize) over the bounded window.
+        let f = acc.features().expect("features over bounded window");
+        assert!(f.to_map().values().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -474,6 +526,59 @@ mod tests {
         // Hard-rule inputs remain valid at the low gate.
         assert!(f.reaction_floor_hits.is_finite());
         assert!(f.whole_line_paste_ratio.is_finite());
+    }
+
+    /// H4 regression: a short session (below the robust gate) emits `NaN` for
+    /// the Tier-3 temporal features. `to_map()` must strip those non-finite
+    /// values so the resulting map is JSON-serializable — otherwise the whole
+    /// `Detection` event fails `serde_json::to_vec` on the server and is
+    /// silently dropped from the audit log and detection store.
+    #[test]
+    fn short_session_to_map_is_serializable_and_strips_non_finite() {
+        let mut acc = SessionAccumulator::default();
+        for _ in 0..20 {
+            acc.record_keystroke(150_000_000, false, 1);
+        }
+        for _ in 0..3 {
+            acc.record_command(2_000_000_000, false, 3.5);
+        }
+        let f = acc
+            .features()
+            .expect("short session should still produce features");
+        // Sanity: the live vector genuinely carries NaN sentinels here.
+        assert!(f.gap_autocorr.is_nan());
+        assert!(f.think_tail_ratio.is_nan());
+        assert!(f.throughput_decay.is_nan());
+
+        let map = f.to_map();
+        // No value in the map is non-finite (the NaN keys were skipped).
+        assert!(
+            map.values().all(|v| v.is_finite()),
+            "to_map must not contain non-finite values: {map:?}"
+        );
+        // The NaN-bearing keys are absent, not mapped to 0.0 (preserves "no
+        // evidence" semantics rather than inventing strong-agent evidence).
+        assert!(!map.contains_key("gap_autocorr"));
+        assert!(!map.contains_key("think_tail_ratio"));
+        assert!(!map.contains_key("throughput_decay"));
+        // The finite Tier-1 / hard-rule features are retained.
+        assert!(map.contains_key("keystroke_cv"));
+        assert!(map.contains_key("reaction_floor_hits"));
+
+        // The map must serialize cleanly (NaN would error here).
+        let json = serde_json::to_vec(&map).expect("map must be JSON-serializable");
+        assert!(!json.is_empty());
+
+        // And, end-to-end, the full Detection payload must serialize too.
+        let detection = aegis_sdk::EventPayload::Detection {
+            subject: "sess-short".into(),
+            verdict: aegis_sdk::Verdict::Uncertain,
+            confidence: 0.5,
+            model: "transparent-additive/v1".into(),
+            reasons: vec![],
+            features: map,
+        };
+        serde_json::to_vec(&detection).expect("Detection payload must be JSON-serializable");
     }
 
     #[test]

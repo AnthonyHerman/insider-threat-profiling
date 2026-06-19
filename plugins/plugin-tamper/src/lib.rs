@@ -115,17 +115,17 @@ fn pid_ns_matches_init() -> bool {
     }
 }
 
+/// Whether this process has *effective* uid 0.
+///
+/// Gated privileged operations (`chattr +i`, `chown`, writing root-owned files,
+/// `systemctl`) all require *effective* privilege, not the real uid — a setuid or
+/// capability-dropped process can have a non-root real uid yet still hold the
+/// privilege these operations need. We therefore test `geteuid()` rather than the
+/// real uid from `/proc/self/status`. `geteuid` cannot fail and needs no
+/// allocation; `libc` is already a dependency.
 fn is_root() -> bool {
-    // Avoid an extra dependency: read the real uid from /proc/self/status.
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("Uid:"))
-                .and_then(|r| r.split_whitespace().next().map(|s| s.to_string()))
-        })
-        .map(|uid| uid == "0")
-        .unwrap_or(false)
+    // SAFETY: `geteuid` is always-safe (no args, no pointers, cannot fail).
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// Is PID 1 systemd? Read its `comm` to decide.

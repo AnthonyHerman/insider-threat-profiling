@@ -22,6 +22,7 @@ pub use inventory;
 
 pub use event::{now_ns, AgentId, Event, EventPayload, SessionId, Severity, Verdict};
 pub use plugin::{
-    DynEntry, DynPluginRegistration, Emitter, Plugin, PluginConstructor, PluginContext, PluginKind,
-    PluginMetadata, PluginRegistration, Subscriptions, DYN_ENTRY_SYMBOL, PLUGIN_API_VERSION,
+    DynEntry, DynFree, DynPluginRegistration, Emitter, Plugin, PluginConstructor, PluginContext,
+    PluginKind, PluginMetadata, PluginRegistration, Subscriptions, DYN_ENTRY_SYMBOL,
+    DYN_FREE_SYMBOL, PLUGIN_API_VERSION,
 };

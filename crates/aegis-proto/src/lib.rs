@@ -33,6 +33,14 @@ pub const PROTO_VERSION: u16 = 1;
 /// Hard cap on a single frame to bound memory on the receive path.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// Upper bound on how much body buffer [`read_message`] pre-allocates up front,
+/// regardless of the (attacker-controlled) length prefix. The body is then read
+/// incrementally, growing the buffer as bytes actually arrive, so a peer that
+/// announces a large frame but sends slowly cannot force a full `MAX_FRAME_BYTES`
+/// allocation per stalled connection. Sized to cover the common batch frame
+/// without a reallocation.
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Errors from the framing/transport codec.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
@@ -150,8 +158,28 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Messag
     if len > MAX_FRAME_BYTES {
         return Err(ProtoError::FrameTooLarge(len));
     }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
+
+    // Do NOT trust the length prefix for the allocation: reserve a bounded amount
+    // up front and grow only as bytes actually arrive. A peer that announces a
+    // 16 MiB frame but sends nothing (or trickles) therefore cannot pin a 16 MiB
+    // zeroed buffer per connection — the buffer never exceeds what was received.
+    let mut buf: Vec<u8> = Vec::with_capacity(len.min(READ_CHUNK_BYTES));
+    while buf.len() < len {
+        // Grow the readable region in bounded steps toward `len`.
+        let want = (buf.len() + READ_CHUNK_BYTES).min(len);
+        if buf.capacity() < want {
+            buf.reserve(want - buf.len());
+        }
+        let prev = buf.len();
+        // Read into the uninitialized spare capacity up to `want`.
+        buf.resize(want, 0);
+        let n = reader.read(&mut buf[prev..want]).await?;
+        if n == 0 {
+            // EOF before the full body arrived: peer closed mid-frame.
+            return Err(ProtoError::Closed);
+        }
+        buf.truncate(prev + n);
+    }
     Ok(serde_json::from_slice(&buf)?)
 }
 
@@ -186,6 +214,74 @@ mod tests {
                 assert_eq!(e2[0].kind, "heartbeat");
             }
             _ => panic!("unexpected message variant"),
+        }
+    }
+
+    /// M2 regression: a peer that announces a large frame but closes after
+    /// sending only a few body bytes must yield `Closed` (EOF mid-frame) rather
+    /// than hanging or forcing a `MAX_FRAME_BYTES` pre-allocation. We drive the
+    /// reader against a fixed byte stream (len prefix + short body, then EOF).
+    #[tokio::test]
+    async fn read_message_short_body_then_eof_is_closed() {
+        // Announce a 1 MiB body but provide only 3 bytes, then EOF.
+        let mut stream: Vec<u8> = Vec::new();
+        let announced: u32 = 1024 * 1024;
+        stream.extend_from_slice(&announced.to_be_bytes());
+        stream.extend_from_slice(b"abc");
+
+        let mut cursor = std::io::Cursor::new(stream);
+        let err = read_message(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ProtoError::Closed),
+            "short body then EOF must be Closed, got {err:?}"
+        );
+    }
+
+    /// A frame whose announced length exceeds `MAX_FRAME_BYTES` is rejected at the
+    /// length check, before any body read or allocation.
+    #[tokio::test]
+    async fn read_message_oversized_length_is_rejected() {
+        let mut stream: Vec<u8> = Vec::new();
+        let announced: u32 = (MAX_FRAME_BYTES as u32).saturating_add(1);
+        stream.extend_from_slice(&announced.to_be_bytes());
+        let mut cursor = std::io::Cursor::new(stream);
+        let err = read_message(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ProtoError::FrameTooLarge(_)), "got {err:?}");
+    }
+
+    /// A large but legitimately-sent frame still round-trips through the
+    /// incremental reader (crosses several `READ_CHUNK_BYTES` boundaries).
+    #[tokio::test]
+    async fn read_message_large_legit_frame_roundtrips() {
+        // Build an EventBatch big enough to span multiple read chunks.
+        let events: Vec<Event> = (0..4000)
+            .map(|i| {
+                Event::new(
+                    "agent-1",
+                    "plugin-session",
+                    EventPayload::Heartbeat { uptime_s: i },
+                )
+            })
+            .collect();
+        let batch = Message::EventBatch {
+            batch_id: Uuid::new_v4(),
+            events,
+        };
+        let bytes = serde_json::to_vec(&batch).unwrap();
+        assert!(
+            bytes.len() > READ_CHUNK_BYTES,
+            "test frame must exceed one chunk to exercise growth"
+        );
+
+        let mut framed: Vec<u8> = Vec::new();
+        framed.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&bytes);
+
+        let mut cursor = std::io::Cursor::new(framed);
+        let got = read_message(&mut cursor).await.unwrap();
+        match got {
+            Message::EventBatch { events, .. } => assert_eq!(events.len(), 4000),
+            other => panic!("unexpected {other:?}"),
         }
     }
 

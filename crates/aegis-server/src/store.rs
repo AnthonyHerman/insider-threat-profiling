@@ -719,6 +719,40 @@ impl Store {
                 events.retain_in(range, |_, _| false)?;
                 let mut alerts = wtxn.open_table(ALERTS)?;
                 alerts.retain_in(range, |_, _| false)?;
+
+                // Prune the secondary index in the SAME txn: drop composite keys
+                // whose `ts_ns` prefix (first 8 bytes of the 24-byte key) is below
+                // the cutoff, so `events_for_agent` does not count/return pointers
+                // to rows just deleted above (which caused sparse/empty pages).
+                let mut index = wtxn.open_table(EVENTS_BY_AGENT)?;
+                // Collect (agent_id, trimmed_keys) first; we cannot mutate the
+                // table while iterating it immutably.
+                let mut rewrites: Vec<(String, Vec<[u8; 24]>)> = Vec::new();
+                for entry in index.iter()? {
+                    let (k, v) = entry?;
+                    let agent_id = k.value().to_string();
+                    let keys: Vec<[u8; 24]> = postcard::from_bytes(v.value())?;
+                    let before = keys.len();
+                    let kept: Vec<[u8; 24]> = keys
+                        .into_iter()
+                        .filter(|key| {
+                            let mut ts = [0u8; 8];
+                            ts.copy_from_slice(&key[..8]);
+                            u64::from_be_bytes(ts) >= cutoff_ts
+                        })
+                        .collect();
+                    if kept.len() != before {
+                        rewrites.push((agent_id, kept));
+                    }
+                }
+                for (agent_id, kept) in rewrites {
+                    if kept.is_empty() {
+                        index.remove(agent_id.as_str())?;
+                    } else {
+                        let bytes = postcard::to_allocvec(&kept)?;
+                        index.insert(agent_id.as_str(), &bytes[..])?;
+                    }
+                }
             }
             wtxn.commit()?;
         }
@@ -1101,11 +1135,47 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].title, "recent");
 
-        // events_by_agent still references both keys, but the pruned event row
-        // is gone from `events`, so only the recent one comes back.
+        // The secondary index is pruned in the same txn (M6), so the stale
+        // composite key for the deleted event is gone: events_for_agent returns
+        // only the surviving recent event and `total` no longer counts the
+        // pruned pointer (no sparse/empty pages).
         let evs = store.events_for_agent("a", 0, 100).unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].ts_ns, now);
+    }
+
+    /// M6 regression: after compaction prunes old events, the `events_by_agent`
+    /// index must not retain pointers to the deleted rows. With pagination
+    /// `page_size == surviving_count`, page 0 must be exactly the survivors and
+    /// page 1 must be empty (a stale pointer would inflate `total` and push the
+    /// real survivors onto a later, partially-empty page).
+    #[test]
+    fn compact_prunes_secondary_index_so_pagination_is_dense() {
+        let (_dir, store) = open_tmp();
+        let now = now_ns();
+        // Two ancient events (expired) and three recent ones.
+        for ts in [1_000u64, 2_000] {
+            store.write_event(&keystroke_event("a", ts)).unwrap();
+        }
+        for d in [3u64, 2, 1] {
+            store
+                .write_event(&keystroke_event("a", now.saturating_sub(d)))
+                .unwrap();
+        }
+        // Before compaction the index has all 5 keys.
+        assert_eq!(store.events_for_agent("a", 0, 100).unwrap().len(), 5);
+
+        store.compact(1_000_000_000).unwrap();
+
+        // Exactly the 3 recent survivors remain, densely paginated.
+        let page0 = store.events_for_agent("a", 0, 3).unwrap();
+        assert_eq!(page0.len(), 3, "page 0 holds all survivors");
+        assert!(
+            store.events_for_agent("a", 1, 3).unwrap().is_empty(),
+            "no stale index pointers spilling onto a second page"
+        );
+        // And all returned rows are the recent ones (none expired).
+        assert!(page0.iter().all(|r| r.ts_ns >= now.saturating_sub(3)));
     }
 
     #[test]

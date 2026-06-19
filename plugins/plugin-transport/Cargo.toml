@@ -28,3 +28,5 @@ hex.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Mint a throwaway leaf cert to unit-test the rotation-aware auth pin binding.
+rcgen = { workspace = true }

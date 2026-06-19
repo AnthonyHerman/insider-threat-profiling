@@ -65,6 +65,14 @@ pub const MAX_CONNECTIONS: usize = 1024;
 /// completes the TLS handshake but never speaks from pinning a slot/task.
 pub const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum idle time in the authenticated session read loop before the server
+/// tears the connection down. A healthy agent sends a keepalive `Ping` well
+/// within this window (default agent keepalive is 15s); the timeout backstops a
+/// silently-stalled authenticated peer that would otherwise pin a connection
+/// permit, task, and `redb` handle indefinitely (Tokio `TcpStream` keepalives are
+/// off by default).
+pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Capacity of a session's command queue (server → agent). Commands beyond this
 /// are reported to the enqueuer as [`crate::registry::RouterError::ChannelFull`].
 const COMMAND_QUEUE_DEPTH: usize = 64;
@@ -74,6 +82,132 @@ const COMMAND_QUEUE_DEPTH: usize = 64;
 /// set); this guards only against in-session retransmits, so a modest cap is
 /// ample and prevents unbounded growth on a very long-lived session.
 const DEDUP_CAPACITY: usize = 65_536;
+
+/// Capacity of the cross-connection (global) replay-dedup window. Larger than the
+/// per-session window because it spans every agent; still O(1)-bounded memory
+/// (~16 bytes/id). FIFO eviction means only genuinely old ids age out.
+const GLOBAL_DEDUP_CAPACITY: usize = 262_144;
+
+/// A de-dup window shared across all connections (see [`accept_loop`]). Wrapped in
+/// an async [`Mutex`] because connection tasks run concurrently; the lock is held
+/// only for the O(1) `insert` and never across an `.await`.
+type SharedDedup = Arc<Mutex<DedupWindow>>;
+
+/// How far an agent-supplied `ts_ns` may lead/lag the server clock before it is
+/// clamped to `now`. The timestamp is the audit-log sort key
+/// ([`composite_key`](crate::store)), so an out-of-range value from a compromised
+/// endpoint would corrupt ordering and pagination. One hour of skew tolerance
+/// covers legitimate clock drift and brief spill replay; anything beyond is reset
+/// to the server's `now_ns()`.
+const MAX_TS_SKEW_NS: u64 = 60 * 60 * 1_000_000_000;
+
+/// Maximum accepted length (bytes) of an agent-supplied `event.source`. Truncated
+/// past this to bound per-row storage and keep logs/UI sane.
+const MAX_SOURCE_LEN: usize = 128;
+
+/// Maximum number of `labels` entries retained on an ingested event.
+const MAX_LABELS: usize = 32;
+/// Maximum length (bytes) of a single label key or value (truncated past this).
+const MAX_LABEL_KV_LEN: usize = 256;
+
+/// A bounded, insertion-ordered de-duplication window over `Event.id`s.
+///
+/// Backs the in-session retransmit guard. A `HashSet` gives O(1) membership but
+/// has no ordered eviction, so the prior implementation evicted in hash-bucket
+/// order and could drop a *recently* seen id (re-opening a replay window). Pairing
+/// the set with a `VecDeque` recording insertion order makes eviction true FIFO:
+/// at capacity the genuine oldest id is removed.
+struct DedupWindow {
+    set: HashSet<uuid::Uuid>,
+    order: std::collections::VecDeque<uuid::Uuid>,
+    capacity: usize,
+}
+
+impl DedupWindow {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        DedupWindow {
+            set: HashSet::with_capacity(capacity),
+            order: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Record `id` as seen. Returns `true` if it was newly inserted, `false` if it
+    /// was already present (a duplicate). Evicts the oldest id first when full.
+    fn insert(&mut self, id: uuid::Uuid) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        self.order.push_back(id);
+        self.set.insert(id);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+/// Clamp/validate agent-supplied event fields on ingest (M5). `agent_id` is
+/// already overwritten with the authenticated identity and `kind` allowlisted by
+/// the caller; this hardens the *remaining* trusted-by-default fields:
+///
+/// * `ts_ns` — clamped to a sane window around the server clock (it is the audit
+///   B-tree sort key, so a wild value corrupts ordering/pagination);
+/// * `source` — truncated to [`MAX_SOURCE_LEN`] (attribution/log-bloat guard);
+/// * `labels` — capped to [`MAX_LABELS`] entries with each key/value truncated to
+///   [`MAX_LABEL_KV_LEN`] (per-write DB bloat guard).
+fn sanitize_ingest_fields(event: &mut Event) {
+    let now = now_ns();
+    let lo = now.saturating_sub(MAX_TS_SKEW_NS);
+    let hi = now.saturating_add(MAX_TS_SKEW_NS);
+    if event.ts_ns < lo || event.ts_ns > hi {
+        event.ts_ns = now;
+    }
+
+    truncate_to(&mut event.source, MAX_SOURCE_LEN);
+
+    if event.labels.len() > MAX_LABELS
+        || event
+            .labels
+            .iter()
+            .any(|(k, v)| k.len() > MAX_LABEL_KV_LEN || v.len() > MAX_LABEL_KV_LEN)
+    {
+        let trimmed: std::collections::BTreeMap<String, String> = event
+            .labels
+            .iter()
+            .take(MAX_LABELS)
+            .map(|(k, v)| {
+                let mut k = k.clone();
+                let mut v = v.clone();
+                truncate_to(&mut k, MAX_LABEL_KV_LEN);
+                truncate_to(&mut v, MAX_LABEL_KV_LEN);
+                (k, v)
+            })
+            .collect();
+        event.labels = trimmed;
+    }
+}
+
+/// Truncate `s` in place to at most `max` bytes, respecting UTF-8 char
+/// boundaries (never splits a multi-byte char).
+fn truncate_to(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
 
 /// Raw telemetry kinds an agent is allowed to push. Derived kinds
 /// (`score`/`detection`/`alert`) and the `custom` escape hatch are rejected: the
@@ -224,6 +358,12 @@ async fn accept_loop(
     pin: [u8; PIN_LEN],
 ) {
     let limiter = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // Bounded de-dup window of recently-seen `Event.id`s shared across ALL
+    // connections (L3): a replay of the same id on a fresh connection — which has
+    // its own per-session window and could land a distinct B-tree key once its
+    // stale `ts_ns` is clamped — is still rejected here. FIFO eviction keeps it
+    // bounded regardless of total traffic.
+    let global_dedup: SharedDedup = Arc::new(Mutex::new(DedupWindow::new(GLOBAL_DEDUP_CAPACITY)));
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -250,10 +390,22 @@ async fn accept_loop(
         let emitter = emitter.clone();
         let store = store.clone();
         let router = router.clone();
+        let global_dedup = global_dedup.clone();
         tokio::spawn(async move {
             // Hold the permit for the whole connection lifetime.
             let _permit = permit;
-            if let Err(e) = handle_conn(tcp, peer, acceptor, emitter, store, router, pin).await {
+            if let Err(e) = handle_conn(
+                tcp,
+                peer,
+                acceptor,
+                emitter,
+                store,
+                router,
+                pin,
+                global_dedup,
+            )
+            .await
+            {
                 tracing::debug!(peer = %peer, error = %e, "ingest: connection ended");
             }
         });
@@ -275,6 +427,7 @@ enum ConnError {
 }
 
 /// Run one accepted connection through the protocol state machine.
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn(
     tcp: tokio::net::TcpStream,
     peer: SocketAddr,
@@ -283,6 +436,7 @@ async fn handle_conn(
     store: Arc<Store>,
     router: Router,
     pin: [u8; PIN_LEN],
+    global_dedup: SharedDedup,
 ) -> Result<(), ConnError> {
     let mut tls = acceptor.accept(tcp).await.map_err(ConnError::Tls)?;
 
@@ -410,7 +564,15 @@ async fn handle_conn(
             )
             .await?;
 
-            let reply = read_message(&mut tls).await?;
+            // Bound the challenge reply: an enrolled (or key-theft) peer can
+            // receive the Noop and then stall forever while holding a connection
+            // permit. Reuse the first-frame deadline; an elapse maps to the same
+            // timeout error as the first frame.
+            let reply =
+                match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_message(&mut tls)).await {
+                    Ok(r) => r?,
+                    Err(_) => return Err(ConnError::FirstFrameTimeout),
+                };
             let sig_b64 = match reply {
                 Message::CommandResult {
                     id,
@@ -449,7 +611,7 @@ async fn handle_conn(
             let _ = store.touch_agent(&agent_id, now_ns());
             tracing::info!(peer = %peer, agent_id = %agent_id, "ingest: session authenticated");
 
-            run_session(tls, agent_id, emitter, store, router).await
+            run_session(tls, agent_id, emitter, store, router, global_dedup).await
         }
 
         // Any other first frame is a protocol violation; close.
@@ -469,6 +631,7 @@ async fn run_session<S>(
     emitter: Arc<dyn Emitter>,
     store: Arc<Store>,
     router: Router,
+    global_dedup: SharedDedup,
 ) -> Result<(), ConnError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -496,7 +659,7 @@ where
     });
 
     // Reader: events / ping / command-results, on this task.
-    let read_result = read_loop(&mut rd, &wr, &agent_id, &emitter, &store).await;
+    let read_result = read_loop(&mut rd, &wr, &agent_id, &emitter, &store, &global_dedup).await;
 
     // Teardown: unregister (only if still ours), stop the writer.
     router.unregister(&agent_id, &cmd_tx).await;
@@ -514,45 +677,51 @@ async fn read_loop<R, W>(
     agent_id: &str,
     emitter: &Arc<dyn Emitter>,
     store: &Arc<Store>,
+    global_dedup: &SharedDedup,
 ) -> Result<(), ConnError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut seen: HashSet<uuid::Uuid> = HashSet::new();
+    let mut seen: DedupWindow = DedupWindow::new(DEDUP_CAPACITY);
 
     loop {
-        let msg = match read_message(rd).await {
-            Ok(m) => m,
+        // Idle deadline: a silent authenticated peer must not pin the session
+        // forever. On elapse we tear the session down cleanly (no error).
+        let msg = match tokio::time::timeout(SESSION_IDLE_TIMEOUT, read_message(rd)).await {
+            Ok(Ok(m)) => m,
             // A clean close (EOF) is the normal end of a session.
-            Err(aegis_proto::ProtoError::Closed) => return Ok(()),
-            Err(e) => return Err(ConnError::Proto(e)),
+            Ok(Err(aegis_proto::ProtoError::Closed)) => return Ok(()),
+            Ok(Err(e)) => return Err(ConnError::Proto(e)),
+            Err(_) => {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    timeout_s = SESSION_IDLE_TIMEOUT.as_secs(),
+                    "ingest: session idle past timeout; closing"
+                );
+                return Ok(());
+            }
         };
 
         match msg {
             Message::EventBatch { batch_id, events } => {
                 let mut accepted: u32 = 0;
                 for mut event in events {
-                    // De-dup in-session retransmits by Event.id.
-                    // If the set is at capacity, evict the oldest quarter before
-                    // inserting so we never forget all recent IDs at once.  The
-                    // previous `clear()`-based approach would forget all 65 536
-                    // previously-seen IDs when the 65 537th arrived, creating a
-                    // window where an attacker could replay any of those IDs in
-                    // the same session.  Evicting only a quarter preserves the
-                    // most-recent three-quarters of the window at all times.
-                    // `HashSet` has no ordered eviction, so we collect a quarter
-                    // of the current entries to drain; the removed IDs are
-                    // effectively the "oldest" in practice because they arrived
-                    // well before the cap was reached.
-                    if seen.len() >= DEDUP_CAPACITY {
-                        let evict_count = DEDUP_CAPACITY / 4;
-                        let to_remove: Vec<_> = seen.iter().take(evict_count).copied().collect();
-                        for id in to_remove {
-                            seen.remove(&id);
-                        }
-                    }
+                    // De-dup in-session retransmits by Event.id. `DedupWindow` is a
+                    // true FIFO (insertion-ordered): at capacity it evicts the
+                    // genuine oldest id, so a recently-seen id can never be evicted
+                    // and replayed within the session (the prior `HashSet` evicted
+                    // in hash-bucket order, which could drop a recent id).
                     if !seen.insert(event.id) {
+                        continue;
+                    }
+                    // Cross-connection replay guard (L3): reject an id already seen
+                    // on any recent connection. Lock held only for the O(1) insert.
+                    if !global_dedup.lock().await.insert(event.id) {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            "ingest: dropping cross-session replayed event id"
+                        );
                         continue;
                     }
 
@@ -567,6 +736,12 @@ where
                         continue;
                     }
                     event.agent_id = agent_id.to_string();
+
+                    // Clamp/validate the remaining agent-supplied fields before
+                    // they reach the store and the bus (M5): a compromised endpoint
+                    // must not corrupt audit ordering, spoof attribution, or bloat
+                    // the DB via oversized `source`/`labels`.
+                    sanitize_ingest_fields(&mut event);
 
                     // Persist to the raw audit log first (so the log is complete
                     // even if the bus drops on a full queue), then emit.
@@ -722,6 +897,97 @@ mod tests {
         let id = Uuid::new_v4();
         assert!(seen.insert(id));
         assert!(!seen.insert(id), "second insert of same id is a dup");
+    }
+
+    /// L4 regression: `DedupWindow` is a true FIFO. The first id inserted must be
+    /// the first evicted at capacity, and a recently-seen id must NOT be evicted
+    /// (the old `HashSet` eviction could drop a recent id, re-opening a replay).
+    #[test]
+    fn dedup_window_evicts_oldest_first_and_dedups() {
+        let mut w = DedupWindow::new(3);
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+
+        // Fill to capacity (3).
+        assert!(w.insert(ids[0]));
+        assert!(w.insert(ids[1]));
+        assert!(w.insert(ids[2]));
+        assert_eq!(w.len(), 3);
+        // A repeat of any held id is a dup.
+        assert!(!w.insert(ids[1]), "held id is a duplicate");
+
+        // Inserting a 4th evicts the OLDEST (ids[0]) only.
+        assert!(w.insert(ids[3]));
+        assert_eq!(w.len(), 3);
+        // ids[0] aged out -> it is now "new" again...
+        assert!(w.insert(ids[0]), "oldest was evicted, so it re-inserts");
+        // ...but the more-recent ids[2]/ids[3] are still remembered.
+        assert!(!w.insert(ids[2]), "recent id must still be remembered");
+        assert!(!w.insert(ids[3]), "recent id must still be remembered");
+    }
+
+    /// M5 regression: out-of-window `ts_ns` is reset to ~now; a far-past or
+    /// far-future timestamp from a compromised endpoint cannot corrupt the audit
+    /// sort key. A timestamp within the skew window is preserved.
+    #[test]
+    fn sanitize_clamps_ts_ns() {
+        let mk = |ts: u64| {
+            let mut e = Event::new("a", "plugin-tty", EventPayload::Heartbeat { uptime_s: 1 });
+            e.ts_ns = ts;
+            e
+        };
+        let now = now_ns();
+
+        // Far future -> reset to ~now.
+        let mut future = mk(now + 10 * MAX_TS_SKEW_NS);
+        sanitize_ingest_fields(&mut future);
+        assert!(future.ts_ns <= now_ns() && future.ts_ns + MAX_TS_SKEW_NS >= now);
+
+        // Far past (epoch) -> reset to ~now.
+        let mut past = mk(1_000);
+        sanitize_ingest_fields(&mut past);
+        assert!(past.ts_ns + MAX_TS_SKEW_NS >= now);
+
+        // Within the window -> preserved exactly.
+        let in_window = now.saturating_sub(MAX_TS_SKEW_NS / 2);
+        let mut ok = mk(in_window);
+        sanitize_ingest_fields(&mut ok);
+        assert_eq!(ok.ts_ns, in_window, "in-window ts must be preserved");
+    }
+
+    /// M5 regression: an over-long `source` is truncated and oversized `labels`
+    /// (too many entries, or over-long key/value) are bounded.
+    #[test]
+    fn sanitize_bounds_source_and_labels() {
+        let mut e = Event::new(
+            "a",
+            "x".repeat(10_000), // oversized source
+            EventPayload::Heartbeat { uptime_s: 1 },
+        );
+        e.ts_ns = now_ns();
+        for i in 0..1000 {
+            e.labels.insert(format!("k{i}"), "v".repeat(10_000));
+        }
+        sanitize_ingest_fields(&mut e);
+
+        assert!(e.source.len() <= MAX_SOURCE_LEN, "source must be truncated");
+        assert!(e.labels.len() <= MAX_LABELS, "labels count must be bounded");
+        assert!(
+            e.labels.values().all(|v| v.len() <= MAX_LABEL_KV_LEN),
+            "label values must be truncated"
+        );
+        assert!(
+            e.labels.keys().all(|k| k.len() <= MAX_LABEL_KV_LEN),
+            "label keys must be bounded"
+        );
+    }
+
+    /// `truncate_to` never splits a multibyte UTF-8 char.
+    #[test]
+    fn truncate_to_respects_char_boundaries() {
+        let mut s = "é".repeat(10); // each 'é' is 2 bytes
+        truncate_to(&mut s, 5); // 5 is mid-char; must back off to 4
+        assert!(s.is_char_boundary(s.len()));
+        assert!(s.len() <= 5);
     }
 
     // --- End-to-end session over real TLS on an ephemeral port -----------

@@ -198,16 +198,54 @@ macro_rules! register_plugin {
 /// `aegis_plugin_entry`. It returns a heap registration the host adopts. The
 /// host checks `api_version` before calling the constructor.
 ///
+/// A plugin **must export a matching free function** (see [`DynFree`]) so the
+/// registration it heap-allocates is freed *in the plugin's own allocator*. The
+/// host never calls `Box::from_raw` on this pointer: a `cdylib` may be linked
+/// against a different global allocator than the host, and freeing host-side
+/// memory the plugin allocated (or vice-versa) is undefined behavior. The host
+/// copies the (`Copy`) fields out through the raw pointer and then hands the
+/// pointer back to the plugin's free function.
+///
 /// ```ignore
 /// #[no_mangle]
-/// pub extern "C" fn aegis_plugin_entry() -> *mut aegis_sdk::DynPluginRegistration { .. }
+/// pub extern "C" fn aegis_plugin_entry() -> *mut aegis_sdk::DynPluginRegistration {
+///     Box::into_raw(Box::new(aegis_sdk::DynPluginRegistration {
+///         api_version: aegis_sdk::PLUGIN_API_VERSION,
+///         constructor: || Box::new(MyPlugin::default()),
+///     }))
+/// }
+///
+/// #[no_mangle]
+/// pub unsafe extern "C" fn aegis_plugin_free_registration(
+///     reg: *mut aegis_sdk::DynPluginRegistration,
+/// ) {
+///     if !reg.is_null() {
+///         drop(Box::from_raw(reg)); // freed in the plugin's allocator
+///     }
+/// }
 /// ```
 pub type DynEntry = unsafe extern "C" fn() -> *mut DynPluginRegistration;
 
 /// Name of the exported symbol the dynamic loader looks up.
 pub const DYN_ENTRY_SYMBOL: &[u8] = b"aegis_plugin_entry";
 
+/// Signature of the paired C-ABI free function a dynamic plugin `cdylib` must
+/// export as `aegis_plugin_free_registration`. The host calls it to release the
+/// [`DynPluginRegistration`] the plugin returned from [`DynEntry`], so the
+/// allocation is freed by the same allocator that produced it. The pointer is
+/// the exact value returned by the entrypoint (possibly null, which the free
+/// function must tolerate).
+pub type DynFree = unsafe extern "C" fn(*mut DynPluginRegistration);
+
+/// Name of the exported free-function symbol the dynamic loader looks up to
+/// release a [`DynPluginRegistration`] in the plugin's own allocator.
+pub const DYN_FREE_SYMBOL: &[u8] = b"aegis_plugin_free_registration";
+
 /// Heap-allocated registration returned across the C ABI by dynamic plugins.
+///
+/// Both fields are `Copy`, so the host reads them out through the raw pointer
+/// and then returns the pointer to the plugin's [`DynFree`] for deallocation —
+/// it must never be dropped via `Box::from_raw` on the host side.
 #[repr(C)]
 pub struct DynPluginRegistration {
     pub api_version: u32,

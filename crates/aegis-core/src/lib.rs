@@ -23,7 +23,7 @@ pub mod host;
 pub mod loader;
 
 pub use bus::BusEmitter;
-pub use config::HostConfig;
+pub use config::{DynamicPluginSpec, HostConfig};
 pub use host::{Host, HostBuilder, RunningHost};
 pub use loader::{load_dynamic, DynamicPlugin};
 

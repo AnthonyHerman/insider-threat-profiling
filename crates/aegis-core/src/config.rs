@@ -30,9 +30,12 @@ pub struct HostConfig {
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
 
-    /// Paths to dynamic plugin shared objects to load at runtime.
+    /// Dynamic plugin shared objects to load at runtime. Each entry carries the
+    /// plugin's expected `name` alongside its `path` so the host can evaluate
+    /// enablement *before* opening the library — loading a `.so` executes its
+    /// entrypoint, so a disabled-but-listed path must never be `dlopen`ed.
     #[serde(default)]
-    pub dynamic_plugins: Vec<PathBuf>,
+    pub dynamic_plugins: Vec<DynamicPluginSpec>,
 
     /// Per-plugin configuration subtrees, keyed by plugin name.
     #[serde(default)]
@@ -41,6 +44,20 @@ pub struct HostConfig {
     /// Bounded per-plugin queue depth (back-pressure point).
     #[serde(default = "default_queue_depth")]
     pub queue_depth: usize,
+}
+
+/// A dynamic (runtime-loaded `cdylib`) plugin declaration.
+///
+/// The `name` is the plugin's registered name and is used to evaluate the
+/// host's enable/disable policy *before* the shared object is opened (opening
+/// it runs native code). After load, the host asserts the library-reported
+/// metadata name matches this `name` and rejects a mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicPluginSpec {
+    /// Registered name of the plugin (must match the library's metadata name).
+    pub name: String,
+    /// Filesystem path to the plugin shared object.
+    pub path: PathBuf,
 }
 
 impl HostConfig {

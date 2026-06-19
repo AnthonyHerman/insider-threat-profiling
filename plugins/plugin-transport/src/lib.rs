@@ -155,14 +155,16 @@ impl Plugin for TransportPlugin {
 fn spawn_buffer_only(ring: Arc<Ring>, data_dir: std::path::PathBuf, shutdown: Shutdown) {
     tokio::spawn(async move {
         let path = data_dir.join("spill.redb");
-        let mut spill = match spill::Spill::open(&path) {
+        // The cap is enforced inside `push` now, so opening with it means the
+        // pre-enroll buffer cannot grow without bound before enrollment completes.
+        let cap = TransportConfig::default().spill_max_bytes;
+        let mut spill = match spill::Spill::open(&path, cap) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "transport: cannot open spill for pre-enroll buffering");
                 return;
             }
         };
-        let cap = TransportConfig::default().spill_max_bytes;
         loop {
             tokio::select! {
                 _ = ring.notified() => {
@@ -171,7 +173,6 @@ fn spawn_buffer_only(ring: Arc<Ring>, data_dir: std::path::PathBuf, shutdown: Sh
                         if let Err(e) = spill.push(&evs) {
                             tracing::warn!(error = %e, "transport: pre-enroll spill push failed");
                         }
-                        let _ = spill.enforce_cap(cap);
                     }
                 }
                 _ = shutdown.wait() => {
@@ -254,7 +255,7 @@ mod tests {
         p.shutdown().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let spill = spill::Spill::open(&dir.join("spill.redb")).unwrap();
+        let spill = spill::Spill::open(&dir.join("spill.redb"), u64::MAX).unwrap();
         assert!(
             spill.len().unwrap() >= 1,
             "events should be buffered to disk"

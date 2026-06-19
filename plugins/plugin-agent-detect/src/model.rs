@@ -196,9 +196,14 @@ impl Model {
             }
             rule_reasons.push("physiological-floor+paste");
         }
-        // (2) Any sub-floor non-paste slip — a "perfection tax". One slip in a
-        //     long session incriminates; pure absence contributes nothing.
-        if f.reaction_floor_hits > 0.0 {
+        // (2) *Sustained* sub-floor non-paste reactions — a "perfection tax".
+        //     A meaningful fraction of typed command gaps below the ~150 ms
+        //     physiological floor is a strong agent signature on its own. We
+        //     require minimum evidence (mirroring rule #1's `>= 0.25`) so a
+        //     single isolated slip in a long human session nudges `p_agent` via
+        //     the weighted average rather than forcing a definitive Agent
+        //     verdict; pure absence still contributes nothing.
+        if f.reaction_floor_hits >= 0.25 {
             if 0.80 > p_agent {
                 p_agent = 0.80;
             }
@@ -380,13 +385,34 @@ mod tests {
 
     #[test]
     fn reaction_floor_hard_rule_ratchets_up() {
-        // A vector that the weighted average alone would rate low-agent, but with
-        // a single physiological-floor slip the hard rule lifts it.
+        // M7: *sustained* sub-floor reactions (>= 25% of typed gaps) trip the
+        // hard rule and ratchet p_agent up; the human baseline alone is low.
         let mut f = human_like();
-        f.reaction_floor_hits = 0.1; // one slip in a long session
+        f.reaction_floor_hits = 0.3; // sustained physiological-floor hits
         let a = Model::default().assess(&f);
         assert!(a.p_agent >= 0.80, "p_agent {}", a.p_agent);
         assert!(a.reasons.iter().any(|r| r == "reaction-time-floor"));
+    }
+
+    #[test]
+    fn single_isolated_floor_slip_does_not_force_agent() {
+        // M7 minimum-evidence gate: a single isolated sub-floor slip in a long
+        // session (tiny fraction) must NOT alone trip the hard rule to a
+        // definitive Agent-leaning 0.80. It should nudge via the weighted
+        // average instead, leaving a clear human well below the Agent threshold.
+        let mut f = human_like();
+        f.reaction_floor_hits = 0.02; // ~1 slip in 50 commands
+        let a = Model::default().assess(&f);
+        assert!(
+            !a.reasons.iter().any(|r| r == "reaction-time-floor"),
+            "isolated slip must not trip the sustained-floor hard rule"
+        );
+        assert!(
+            a.p_agent < 0.80,
+            "isolated slip must not force a definitive Agent verdict (p_agent={})",
+            a.p_agent
+        );
+        assert_ne!(a.verdict, Verdict::Agent);
     }
 
     #[test]

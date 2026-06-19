@@ -14,8 +14,8 @@ pub mod model;
 pub mod synth;
 
 use aegis_sdk::{
-    register_plugin, Event, EventPayload, Plugin, PluginContext, PluginKind, PluginMetadata,
-    Subscriptions, Verdict,
+    now_ns, register_plugin, Event, EventPayload, Plugin, PluginContext, PluginKind,
+    PluginMetadata, Subscriptions, Verdict,
 };
 use async_trait::async_trait;
 use features::SessionAccumulator;
@@ -27,6 +27,13 @@ use tokio::sync::Mutex;
 
 fn default_ewma_alpha() -> f64 {
     0.3
+}
+fn default_session_ttl_s() -> u64 {
+    // Evict sessions idle beyond this many seconds. Bounds memory when a
+    // `SessionEnd` is lost (the only explicit removal today), so a missing end
+    // event cannot pin a session's accumulator forever. 1 hour is generous for
+    // an interactive session's idle gap while still reclaiming abandoned ones.
+    3600
 }
 fn default_escalate_logit() -> f64 {
     // A sustained EWMA of logit(p_agent) ≥ 0.25 ⇒ a steady p_agent ≈ 0.56:
@@ -46,7 +53,8 @@ pub struct DetectConfig {
     pub assess_on_session_end: bool,
     /// EWMA smoothing factor for the per-session sequential test. Each
     /// re-assessment folds its log-likelihood-ratio in with this weight; larger
-    /// ⇒ more reactive, smaller ⇒ steadier. Defaults to 0.3.
+    /// ⇒ more reactive, smaller ⇒ steadier. Must be in `(0.0, 1.0]` (validated
+    /// in `init`); `> 1.0` would put negative weight on the prior. Defaults to 0.3.
     #[serde(default = "default_ewma_alpha")]
     pub ewma_alpha: f64,
     /// Escalation threshold for the smoothed log-odds. When the EWMA of
@@ -57,6 +65,17 @@ pub struct DetectConfig {
     /// consistent sub-threshold leaners while keeping the human cost < 1%).
     #[serde(default = "default_escalate_logit")]
     pub escalate_logit: f64,
+    /// Idle TTL (seconds) after which a session with no further events is
+    /// evicted, so a missing `SessionEnd` cannot pin its accumulator forever.
+    #[serde(default = "default_session_ttl_s")]
+    pub session_ttl_s: u64,
+    /// If `false` (default), keystroke/command events for a session that never
+    /// had a `SessionStart` are dropped rather than implicitly creating an
+    /// accumulator — this prevents an unbounded number of unknown sessions from
+    /// being minted by a hostile or buggy event stream. Set `true` only when
+    /// upstream is trusted to not emit pre-`SessionStart` telemetry.
+    #[serde(default)]
+    pub assess_on_missing_session: bool,
 }
 
 impl Default for DetectConfig {
@@ -66,6 +85,8 @@ impl Default for DetectConfig {
             assess_on_session_end: true,
             ewma_alpha: default_ewma_alpha(),
             escalate_logit: default_escalate_logit(),
+            session_ttl_s: default_session_ttl_s(),
+            assess_on_missing_session: false,
         }
     }
 }
@@ -81,6 +102,8 @@ struct SessionState {
     /// Latch: we have already emitted the sequential escalation once (avoids
     /// alert spam on every subsequent tick).
     escalated: bool,
+    /// Wall-clock (ns) of the last event for this session, for idle-TTL eviction.
+    last_activity_ns: u64,
 }
 
 pub struct AgentDetectPlugin {
@@ -97,6 +120,17 @@ impl Default for AgentDetectPlugin {
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+/// Evict sessions whose last activity is older than `ttl_ns` relative to `now`.
+/// Called opportunistically while the session map is locked, so a missing
+/// `SessionEnd` cannot pin a session's accumulator forever. A `ttl_ns` of 0
+/// disables eviction.
+fn evict_idle(sessions: &mut HashMap<String, SessionState>, now: u64, ttl_ns: u64) {
+    if ttl_ns == 0 {
+        return;
+    }
+    sessions.retain(|_, s| now.saturating_sub(s.last_activity_ns) <= ttl_ns);
 }
 
 impl AgentDetectPlugin {
@@ -182,17 +216,25 @@ impl Plugin for AgentDetectPlugin {
 
     async fn init(&mut self, ctx: &PluginContext) -> anyhow::Result<()> {
         self.config = ctx.config_as()?;
+        // `ewma_alpha` is a smoothing weight in (0, 1]; alpha > 1 puts negative
+        // weight on the prior (see the EWMA update in `maybe_emit`), and alpha
+        // <= 0 freezes the estimate. Reject out-of-range values up front.
+        let alpha = self.config.ewma_alpha;
+        if !(alpha > 0.0 && alpha <= 1.0) {
+            anyhow::bail!("ewma_alpha must be in (0.0, 1.0], got {alpha}");
+        }
         Ok(())
     }
 
     async fn handle(&self, event: &Event, ctx: &PluginContext) -> anyhow::Result<()> {
+        let now = now_ns();
+        let ttl_ns = self.config.session_ttl_s.saturating_mul(1_000_000_000);
         match &event.payload {
             EventPayload::SessionStart { session_id, .. } => {
-                self.sessions
-                    .lock()
-                    .await
-                    .entry(session_id.clone())
-                    .or_default();
+                let mut guard = self.sessions.lock().await;
+                evict_idle(&mut guard, now, ttl_ns);
+                let state = guard.entry(session_id.clone()).or_default();
+                state.last_activity_ns = now;
             }
             EventPayload::Keystroke {
                 session_id,
@@ -202,11 +244,22 @@ impl Plugin for AgentDetectPlugin {
             } => {
                 {
                     let mut guard = self.sessions.lock().await;
-                    let state = guard.entry(session_id.clone()).or_default();
+                    evict_idle(&mut guard, now, ttl_ns);
+                    // Only `SessionStart` creates a session unless explicitly
+                    // configured otherwise; drop telemetry for unknown sessions
+                    // so a hostile stream cannot mint unbounded accumulators.
+                    let state = match guard.get_mut(session_id) {
+                        Some(state) => state,
+                        None if self.config.assess_on_missing_session => {
+                            guard.entry(session_id.clone()).or_default()
+                        }
+                        None => return Ok(()),
+                    };
                     state
                         .acc
                         .record_keystroke(*inter_arrival_ns, *is_paste, *burst_len);
                     state.since_last_assess += 1;
+                    state.last_activity_ns = now;
                 }
                 self.maybe_emit(session_id, ctx, false).await;
             }
@@ -219,11 +272,19 @@ impl Plugin for AgentDetectPlugin {
             } => {
                 {
                     let mut guard = self.sessions.lock().await;
-                    let state = guard.entry(session_id.clone()).or_default();
+                    evict_idle(&mut guard, now, ttl_ns);
+                    let state = match guard.get_mut(session_id) {
+                        Some(state) => state,
+                        None if self.config.assess_on_missing_session => {
+                            guard.entry(session_id.clone()).or_default()
+                        }
+                        None => return Ok(()),
+                    };
                     state
                         .acc
                         .record_command(*inter_command_ns, *had_backspace, *shannon_entropy);
                     state.since_last_assess += 1;
+                    state.last_activity_ns = now;
                 }
                 self.maybe_emit(session_id, ctx, false).await;
             }
@@ -263,6 +324,79 @@ mod tests {
         assert!(c.assess_on_session_end);
         assert!((c.ewma_alpha - 0.3).abs() < 1e-9);
         assert!((c.escalate_logit - 0.25).abs() < 1e-9);
+        assert_eq!(c.session_ttl_s, 3600);
+        assert!(!c.assess_on_missing_session);
+    }
+
+    /// H3 regression (unknown-session guard): telemetry for a session that never
+    /// had a `SessionStart` is dropped by default and does NOT mint an
+    /// accumulator, so a hostile/buggy stream cannot grow the session map.
+    #[tokio::test]
+    async fn unknown_session_telemetry_is_dropped() {
+        let emitter = Arc::new(CapturingEmitter::default());
+        let ctx = test_ctx(emitter.clone());
+        let plugin = AgentDetectPlugin::default();
+        // 5000 keystrokes for 5000 distinct unknown sessions — none started.
+        for i in 0..5000u32 {
+            plugin
+                .handle(
+                    &Event::new(
+                        "test-agent",
+                        "test",
+                        EventPayload::Keystroke {
+                            session_id: format!("ghost-{i}"),
+                            inter_arrival_ns: 150_000_000,
+                            is_paste: false,
+                            burst_len: 1,
+                        },
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+        }
+        // No session was created, and nothing was emitted.
+        assert_eq!(plugin.sessions.lock().await.len(), 0);
+        assert!(emitter.events.lock().unwrap().is_empty());
+    }
+
+    /// H3 regression (TTL eviction): `evict_idle` reclaims sessions idle beyond
+    /// the TTL so a missing `SessionEnd` cannot pin memory forever.
+    #[test]
+    fn idle_sessions_are_evicted_by_ttl() {
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        // One fresh, one stale relative to `now`.
+        let now = 10_000_000_000u64; // 10s
+        let ttl_ns = 1_000_000_000u64; // 1s
+        sessions.insert(
+            "fresh".into(),
+            SessionState {
+                last_activity_ns: now,
+                ..Default::default()
+            },
+        );
+        sessions.insert(
+            "stale".into(),
+            SessionState {
+                last_activity_ns: now - 5_000_000_000, // 5s ago, > TTL
+                ..Default::default()
+            },
+        );
+        evict_idle(&mut sessions, now, ttl_ns);
+        assert!(sessions.contains_key("fresh"));
+        assert!(!sessions.contains_key("stale"));
+
+        // ttl_ns == 0 disables eviction even for a long-idle session.
+        let mut s2: HashMap<String, SessionState> = HashMap::new();
+        s2.insert(
+            "ancient".into(),
+            SessionState {
+                last_activity_ns: 0,
+                ..Default::default()
+            },
+        );
+        evict_idle(&mut s2, now + 1_000_000_000_000, 0);
+        assert_eq!(s2.len(), 1);
     }
 
     #[test]
@@ -278,6 +412,29 @@ mod tests {
         assert!(!c.assess_on_session_end);
         assert!((c.ewma_alpha - 0.3).abs() < 1e-9);
         assert!((c.escalate_logit - 0.25).abs() < 1e-9);
+    }
+
+    /// L9: `init` rejects an out-of-range `ewma_alpha` (alpha > 1.0 puts
+    /// negative weight on the prior); a valid alpha is accepted.
+    #[tokio::test]
+    async fn init_rejects_out_of_range_ewma_alpha() {
+        let mut plugin = AgentDetectPlugin::default();
+        let bad = PluginContext {
+            agent_id: "a".into(),
+            data_dir: std::env::temp_dir(),
+            config: serde_json::json!({ "assess_every": 10, "assess_on_session_end": true, "ewma_alpha": 2.0 }),
+            emitter: Arc::new(CapturingEmitter::default()),
+        };
+        assert!(plugin.init(&bad).await.is_err());
+
+        let mut plugin_ok = AgentDetectPlugin::default();
+        let good = PluginContext {
+            agent_id: "a".into(),
+            data_dir: std::env::temp_dir(),
+            config: serde_json::json!({ "assess_every": 10, "assess_on_session_end": true, "ewma_alpha": 0.3 }),
+            emitter: Arc::new(CapturingEmitter::default()),
+        };
+        assert!(plugin_ok.init(&good).await.is_ok());
     }
 
     /// Test emitter that captures every emitted event.
@@ -450,6 +607,24 @@ mod tests {
             let ctx = test_ctx(emitter.clone());
             let plugin = AgentDetectPlugin::default();
             let sid: SessionId = format!("h-{seed}");
+            // Production contract: a session is created by SessionStart before
+            // any telemetry; unknown-session telemetry is dropped by default.
+            plugin
+                .handle(
+                    &Event::new(
+                        "test-agent",
+                        "test",
+                        EventPayload::SessionStart {
+                            session_id: sid.clone(),
+                            tty: None,
+                            user: "u".into(),
+                            remote: None,
+                        },
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap();
             let mut rng = Rng::new(seed);
             for evt in synth_events(&ProfileParams::human(), &mut rng, 22) {
                 let payload = match evt {

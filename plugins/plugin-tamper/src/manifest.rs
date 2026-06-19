@@ -51,6 +51,28 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// SHA-256 (lowercase hex) of everything `reader` yields, hashed in fixed-size
+/// chunks so an arbitrarily large file is never buffered into memory at once.
+///
+/// `Sha256` implements [`io::Write`], so [`io::copy`] streams the file straight
+/// through the hasher. This is what lets [`verify`] hash a protected file without
+/// a hostile same-size replacement forcing an unbounded allocation.
+fn hash_reader<R: io::Read>(reader: &mut R) -> io::Result<String> {
+    struct HashSink(Sha256);
+    impl io::Write for HashSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = HashSink(Sha256::new());
+    io::copy(reader, &mut sink)?;
+    Ok(hex::encode(sink.0.finalize()))
+}
+
 impl Manifest {
     /// Build a manifest by reading and hashing each path (install time).
     ///
@@ -138,27 +160,55 @@ pub fn classify(expected: &ManifestEntry, observed: Option<(&[u8], u64)>) -> Dri
     }
 }
 
-/// Runtime: read each manifest path and classify it against the baseline.
+/// Runtime: stat each manifest path, then classify it against the baseline.
 ///
-/// A path that cannot be read is reported as [`DriftKind::Missing`] (it has, from
-/// the monitor's standpoint, ceased to be the protected file). Returns one
-/// `(path, verdict)` per entry, in manifest order.
+/// Hardened against a hostile multi-GB same-path replacement (this runs every
+/// `check_interval_s`):
+///
+/// 1. **`metadata` size pre-filter** — if the file's length differs from the
+///    recorded [`ManifestEntry::len`], it is [`DriftKind::SizeChanged`]
+///    immediately, with **no read** (so an oversized decoy is never slurped).
+/// 2. **streaming hash** — only when the size matches is the file hashed, and
+///    then in fixed-size chunks via [`hash_reader`] (never buffered whole), so a
+///    same-size-claimed hostile file cannot force an unbounded allocation either.
+///
+/// A path that cannot be stat'd/opened is reported as [`DriftKind::Missing`].
+/// Returns one `(path, verdict)` per entry, in manifest order.
 #[must_use]
 pub fn verify(manifest: &Manifest) -> Vec<(PathBuf, DriftKind)> {
     manifest
         .entries
         .iter()
-        .map(|entry| {
-            let verdict = match std::fs::read(&entry.path) {
-                Ok(bytes) => {
-                    let len = bytes.len() as u64;
-                    classify(entry, Some((&bytes, len)))
-                }
-                Err(_) => DriftKind::Missing,
-            };
-            (entry.path.clone(), verdict)
-        })
+        .map(|entry| (entry.path.clone(), verify_entry(entry)))
         .collect()
+}
+
+/// Classify a single entry against the on-disk file using the stat-then-stream
+/// strategy described on [`verify`].
+fn verify_entry(entry: &ManifestEntry) -> DriftKind {
+    // `symlink_metadata` does not traverse a final symlink: if the protected file
+    // was swapped for a symlink, that is itself drift (the link's own length will
+    // not match) rather than a read of whatever it points at.
+    let meta = match std::fs::symlink_metadata(&entry.path) {
+        Ok(m) => m,
+        Err(_) => return DriftKind::Missing,
+    };
+    if !meta.is_file() {
+        // A directory/symlink/socket where a regular file was recorded is drift.
+        return DriftKind::SizeChanged;
+    }
+    if meta.len() != entry.len {
+        return DriftKind::SizeChanged;
+    }
+    // Sizes match: stream-hash to detect a same-length content swap.
+    match std::fs::File::open(&entry.path) {
+        Ok(mut f) => match hash_reader(&mut f) {
+            Ok(digest) if digest == entry.sha256 => DriftKind::Ok,
+            Ok(_) => DriftKind::ContentChanged,
+            Err(_) => DriftKind::Missing,
+        },
+        Err(_) => DriftKind::Missing,
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +329,45 @@ mod tests {
     fn from_paths_errors_on_missing_file() {
         let missing = PathBuf::from("/nonexistent/aegis/does-not-exist");
         assert!(Manifest::from_paths(&[missing]).is_err());
+    }
+
+    #[test]
+    fn hash_reader_matches_hash_bytes() {
+        // The streaming hasher must produce the identical digest to the in-memory
+        // one for the same input (so verify() agrees with from_paths()).
+        let data = b"the quick brown fox jumps over the lazy dog";
+        let mut cur = std::io::Cursor::new(&data[..]);
+        assert_eq!(hash_reader(&mut cur).unwrap(), hash_bytes(data));
+        // Empty input -> SHA-256("").
+        let mut empty = std::io::Cursor::new(&b""[..]);
+        assert_eq!(hash_reader(&mut empty).unwrap(), hash_bytes(b""));
+    }
+
+    /// L8 regression: `verify` classifies a size mismatch via the metadata
+    /// pre-filter (SizeChanged) and a same-size content swap via the streaming
+    /// hash (ContentChanged), and reports a swapped-in symlink/dir as drift.
+    #[test]
+    fn verify_uses_size_prefilter_then_streams() {
+        let dir = std::env::temp_dir().join(format!("aegis-manifest-l8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bin");
+        std::fs::write(&f, b"hello").unwrap();
+        let m = Manifest::from_paths(std::slice::from_ref(&f)).unwrap();
+        assert_eq!(verify(&m)[0].1, DriftKind::Ok);
+
+        // Grow the file: different length -> SizeChanged (no content read needed).
+        std::fs::write(&f, b"hello world, this is much longer").unwrap();
+        assert_eq!(verify(&m)[0].1, DriftKind::SizeChanged);
+
+        // Same length, different bytes -> ContentChanged via streaming hash.
+        std::fs::write(&f, b"world").unwrap(); // 5 bytes, matches baseline len
+        assert_eq!(verify(&m)[0].1, DriftKind::ContentChanged);
+
+        // Replace the regular file with a directory -> drift, not a panic/read.
+        std::fs::remove_file(&f).unwrap();
+        std::fs::create_dir(&f).unwrap();
+        assert_eq!(verify(&m)[0].1, DriftKind::SizeChanged);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

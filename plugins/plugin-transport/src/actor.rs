@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aegis_proto::pin::PIN_LEN;
+use aegis_proto::pin::{self, PIN_LEN};
 use aegis_proto::tls::{self, AUTH_LABEL};
 use aegis_proto::{read_message, write_message, Message, ServerCommand, PROTO_VERSION};
 use aegis_sdk::{Emitter, Event, EventPayload, Severity};
@@ -104,9 +104,10 @@ enum SessionEnd {
 
 /// Run the actor until shutdown. Owns the reconnect/backoff outer loop.
 pub async fn run(mut state: ActorState) {
-    // The spill lives for the whole actor; open it once.
+    // The spill lives for the whole actor; open it once with the configured
+    // retention cap so `push` enforces it on every tier (hot path + shutdown drain).
     let spill_path = state.data_dir.join("spill.redb");
-    let spill = match Spill::open(&spill_path) {
+    let spill = match Spill::open(&spill_path, state.cfg.spill_max_bytes) {
         Ok(s) => Arc::new(Mutex::new(s)),
         Err(e) => {
             tracing::error!(error = %e, path = %spill_path.display(),
@@ -261,15 +262,24 @@ async fn connect_and_serve(state: &mut ActorState, spill: &Arc<Mutex<Spill>>) ->
         }
     };
 
-    // --- RFC-5705 exporter: MUST be read on the typed stream BEFORE split. ---
+    // --- RFC-5705 exporter + served-cert pin: read on the typed stream BEFORE
+    // split (both reach the rustls connection handle, lost after `split`). ---
     let mut exporter = [0u8; 32];
-    {
+    let bound_pin: [u8; PIN_LEN] = {
         let (_io, conn) = tls_stream.get_ref();
         if let Err(e) = conn.export_keying_material(&mut exporter, AUTH_LABEL, None) {
             tracing::warn!(error = %e, "transport: failed to export TLS keying material");
             return SessionEnd::Retry;
         }
-    }
+        // Bind the auth digest to the pin of the cert the server ACTUALLY served
+        // this handshake, computed from the verified peer leaf — not blindly to
+        // `server_pins[0]`. During a rotation where the agent holds {old, new}
+        // pins but the server already serves the new cert, the pinned-TLS
+        // handshake still succeeds (pin-set match) yet the old `server_pins[0]`
+        // would mismatch the server's digest and wedge the agent in `Fatal`.
+        // Signing the served leaf's fingerprint makes both ends hash the same pin.
+        bind_pin(conn.peer_certificates(), &state.identity.server_pins[0])
+    };
 
     let (mut rd, wr) = tokio::io::split(tls_stream);
     let wr = Arc::new(Mutex::new(wr));
@@ -277,7 +287,7 @@ async fn connect_and_serve(state: &mut ActorState, spill: &Arc<Mutex<Spill>>) ->
     // --- Handshake: ClientHello → Noop challenge → CommandResult(sig) → ServerHello ---
     // The handshake borrows the read half by &mut and returns it to us on
     // success, so the serve loop takes clean ownership (no Mutex/swap dance).
-    match handshake(state, &mut rd, &wr, &exporter).await {
+    match handshake(state, &mut rd, &wr, &exporter, &bound_pin).await {
         Ok(()) => {
             tracing::info!(agent_id = %state.agent_id, host, port, "transport: online");
             serve_online(state, spill, rd, wr).await
@@ -289,6 +299,30 @@ async fn connect_and_serve(state: &mut ActorState, spill: &Arc<Mutex<Spill>>) ->
         Err(HandshakeErr::Retry(reason)) => {
             tracing::warn!(reason, "transport: handshake failed");
             SessionEnd::Retry
+        }
+    }
+}
+
+/// Choose the pin to bind the session-auth digest to: the SHA-256 of the leaf
+/// certificate the server actually served this handshake, or `fallback` (the
+/// first configured pin) if no peer certificate is somehow available.
+///
+/// Factored out of [`connect_and_serve`] so the rotation-binding choice is
+/// unit-testable without a live TLS handshake. `peer_certs` is what
+/// `rustls::ClientConnection::peer_certificates()` returns after a completed
+/// handshake (the leaf is the first element).
+fn bind_pin(
+    peer_certs: Option<&[tokio_rustls::rustls::pki_types::CertificateDer<'_>]>,
+    fallback: &[u8; PIN_LEN],
+) -> [u8; PIN_LEN] {
+    match peer_certs.and_then(|c| c.first()) {
+        Some(leaf) => pin::fingerprint(leaf.as_ref()),
+        None => {
+            tracing::warn!(
+                "transport: no peer certificate after handshake; \
+                 falling back to server_pins[0] for auth binding"
+            );
+            *fallback
         }
     }
 }
@@ -308,6 +342,7 @@ async fn handshake<R, W>(
     rd: &mut R,
     wr: &Arc<Mutex<W>>,
     exporter: &[u8],
+    bound_pin: &[u8; PIN_LEN],
 ) -> Result<(), HandshakeErr>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -349,14 +384,14 @@ where
         )));
     }
 
-    // Bind the auth to the first configured pin: the digest's pin field is an
-    // agreed convention both ends compute identically (the server knows which
-    // pin it served and verifies against the same value).
-    let pin: &[u8; PIN_LEN] = &state.identity.server_pins[0];
+    // Bind the auth digest to `bound_pin` — the fingerprint of the cert the
+    // server actually served this handshake (see `connect_and_serve`). The server
+    // verifies against the SHA-256 of its own leaf, so signing the served leaf's
+    // pin makes both ends hash identical bytes even mid-rotation.
     let nonce = auth::nonce_from_challenge(&challenge_id);
     let sig_b64 = auth::sign_auth(
         &state.identity.signing_key,
-        pin,
+        bound_pin,
         &state.agent_id,
         &nonce,
         exporter,
@@ -376,13 +411,32 @@ where
         .map_err(|e| HandshakeErr::Retry(format!("read ServerHello: {e}")))?;
     match resp {
         Message::ServerHello { accepted: true, .. } => Ok(()),
+        // A protocol-version mismatch is genuinely unrecoverable (retrying with
+        // the same binary cannot help): keep it Fatal so the actor stops.
+        Message::ServerHello {
+            accepted: false,
+            proto_version,
+            ..
+        } if proto_version != PROTO_VERSION => Err(HandshakeErr::Fatal(format!(
+            "server speaks proto_version {proto_version}, agent speaks {PROTO_VERSION}"
+        ))),
         Message::ServerHello {
             accepted: false,
             reason,
             ..
-        } => Err(HandshakeErr::Fatal(
-            reason.unwrap_or_else(|| "no reason given".into()),
-        )),
+        } => {
+            // Retry (with backoff), not Fatal: an auth rejection can be a
+            // transient rotation window (server mid-roll) rather than genuine
+            // de-provisioning. Backing off and retrying lets a rotation self-heal;
+            // a truly de-provisioned agent simply keeps backing off (no tight
+            // loop) until an operator re-enrolls it. Binding the digest to the
+            // served cert (above) already removes the common rotation mismatch;
+            // this is defense in depth for the residual window.
+            Err(HandshakeErr::Retry(format!(
+                "server rejected session: {}",
+                reason.unwrap_or_else(|| "no reason given".into())
+            )))
+        }
         other => Err(HandshakeErr::Retry(format!(
             "expected ServerHello, got {other:?}"
         ))),
@@ -962,6 +1016,34 @@ mod tests {
         assert!(estimate_size(&ev(1)) > 0);
     }
 
+    /// M1 regression: `bind_pin` must bind to the pin of the SERVED leaf cert, not
+    /// the configured fallback (`server_pins[0]`). This is what lets a rotation
+    /// window self-heal — the agent signs whatever cert the server is currently
+    /// serving (which TLS already verified is in the agent's pin set), so the
+    /// server's digest (computed over its own leaf) matches.
+    #[test]
+    fn bind_pin_uses_served_leaf_not_fallback() {
+        use tokio_rustls::rustls::pki_types::CertificateDer;
+        // Mint a "served" cert; its pin is what the server would verify against.
+        let ck = rcgen::generate_simple_self_signed(vec!["aegisd".to_string()]).unwrap();
+        let served_der = ck.cert.der().to_vec();
+        let served_pin = aegis_proto::pin::fingerprint(&served_der);
+
+        // A different (stale rotation) fallback pin the agent happens to hold first.
+        let stale_fallback = [0xABu8; PIN_LEN];
+        assert_ne!(served_pin, stale_fallback);
+
+        let leaf = CertificateDer::from(served_der);
+        let certs = [leaf];
+        let bound = bind_pin(Some(&certs), &stale_fallback);
+        assert_eq!(bound, served_pin, "must bind to the served leaf's pin");
+
+        // With no peer cert (degenerate), fall back to the configured pin.
+        assert_eq!(bind_pin(None, &stale_fallback), stale_fallback);
+        let empty: [CertificateDer; 0] = [];
+        assert_eq!(bind_pin(Some(&empty), &stale_fallback), stale_fallback);
+    }
+
     #[test]
     fn parse_server_variants() {
         assert_eq!(
@@ -1135,7 +1217,9 @@ mod tests {
     #[tokio::test]
     async fn online_sends_batch_and_acks_clear_spill() {
         let dir = tmp_db("online-ack");
-        let spill = Arc::new(Mutex::new(Spill::open(&dir.join("spill.redb")).unwrap()));
+        let spill = Arc::new(Mutex::new(
+            Spill::open(&dir.join("spill.redb"), u64::MAX).unwrap(),
+        ));
         let ring = Arc::new(Ring::new(1000));
         for i in 0..3 {
             ring.offer(ev(i));
@@ -1195,7 +1279,9 @@ mod tests {
     #[tokio::test]
     async fn fifo_single_in_flight_blocks_second_batch() {
         let dir = tmp_db("fifo");
-        let spill = Arc::new(Mutex::new(Spill::open(&dir.join("spill.redb")).unwrap()));
+        let spill = Arc::new(Mutex::new(
+            Spill::open(&dir.join("spill.redb"), u64::MAX).unwrap(),
+        ));
         let ring = Arc::new(Ring::new(1000));
         ring.offer(ev(1));
         let cfg = TransportConfig {
