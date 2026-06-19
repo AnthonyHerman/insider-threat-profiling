@@ -1,0 +1,105 @@
+# =============================================================================
+# Aegis server (aegisd) — example host configuration
+# =============================================================================
+#
+# Reference configuration for the server's plugin host (`HostConfig`, see
+# crates/aegis-core/src/config.rs) documenting the CENTRAL PROCESSOR subtrees and
+# their tunables.
+#
+# IMPORTANT — how the server is actually configured today:
+#   `aegisd run` builds its `HostConfig` IN-PROCESS (HostConfig::new("aegisd"))
+#   and does NOT take a `--config <file>` flag — see crates/aegis-server/src/main.rs.
+#   Its runtime knobs are the CLI flags:
+#       aegisd run --listen 0.0.0.0:8443 --http 127.0.0.1:8080 --data-dir /var/lib/aegis
+#   The server links the central processors statically and runs them with their
+#   built-in defaults (the values reproduced below). This file therefore serves
+#   two purposes:
+#     1. a documented reference for the central-processor config schema, and
+#     2. a drop-in starting point if/when the server learns to load a TOML
+#        (the schema and field names here match the plugin config structs).
+#   Editing this file does not change a running `aegisd`; tune via flags + the
+#   defaults shown here.
+#
+# The server processes INGESTED telemetry; it runs no local collectors (no
+# plugin-session / plugin-process / plugin-tty / plugin-transport here).
+# =============================================================================
+
+# Stable identity of the server host. The server uses "aegisd".
+agent_id = "aegisd"
+
+# Root directory for the embedded redb store and the self-signed TLS material
+# (the cert whose SHA-256 the agents pin). Mirrors `aegisd run --data-dir`.
+# Default: "./data/server"; a deployment uses /var/lib/aegis.
+data_dir = "/var/lib/aegis"
+
+# Bounded per-plugin queue depth (back-pressure point). Default: 4096.
+queue_depth = 4096
+
+# Load policy. The server discovers its statically-linked central processors and
+# adds the embedded store sink explicitly. Leave `enabled_plugins` unset to load
+# all discovered processors; use `disabled_plugins` to drop one.
+# enabled_plugins = ["plugin-agent-detect", "plugin-scoring"]
+disabled_plugins = []
+
+# Dynamic plugins: unused by the self-contained server (everything is compiled
+# in). The single static binary is the whole deployment — see the Dockerfile.
+# dynamic_plugins = []
+
+# =============================================================================
+# Central processors
+# =============================================================================
+
+# --- plugin-agent-detect: the flagship agent-vs-human detector -----------------
+# Consumes content-free timing/structure telemetry (keystroke + command.observed)
+# from enrolled agents, accumulates per-session features, and emits a Detection
+# verdict via the transparent additive model.
+[plugins."plugin-agent-detect"]
+# Re-assess after every N new events for a session (live verdicts). Default: 10.
+assess_every = 10
+# Also emit a final verdict when a session ends. Default: true.
+assess_on_session_end = true
+# EWMA smoothing factor for the per-session sequential test; must be in (0.0, 1.0]
+# (validated at init). Larger = more reactive, smaller = steadier. Default: 0.3.
+ewma_alpha = 0.3
+# Escalation threshold on the smoothed log-odds: when the EWMA of logit(p_agent)
+# reaches this, a merely "Uncertain" session is escalated to "Agent" — this
+# defeats dead-band camping (a steady ~0.56 p_agent that sits just below the
+# per-snapshot Agent threshold). Default: 0.25.
+#
+# NOTE: 0.25 is calibrated against a SYNTHETIC human distribution for a marginal
+# human false-positive cost < 1%. A field deployment should re-derive it from its
+# own human population.
+escalate_logit = 0.25
+# Idle TTL (seconds) after which a session with no further events is evicted, so
+# a lost SessionEnd cannot pin its accumulator forever. Default: 3600 (1 hour).
+session_ttl_s = 3600
+# If false (default), keystroke/command events for a session that never had a
+# SessionStart are DROPPED rather than implicitly creating an accumulator — this
+# prevents a hostile/buggy stream from minting unbounded unknown sessions. Set
+# true ONLY when upstream is trusted not to emit pre-SessionStart telemetry.
+assess_on_missing_session = false
+
+# --- plugin-scoring: per-subject risk aggregation + alerting -------------------
+# Folds heterogeneous signals (agent detections, suspicious process execs,
+# upstream alerts) into one decaying per-subject risk score and raises an Alert
+# when a subject crosses the threshold.
+[plugins."plugin-scoring"]
+# Risk added when a subject is classified as an agent (scaled by confidence).
+# Default: 60.0.
+agent_detection_weight = 60.0
+# Risk added per suspicious process exec. Default: 5.0.
+process_weight = 5.0
+# Multiplicative decay applied to a subject's score on each update; must be in
+# (0.0, 1.0] (validated at init). Default: 0.98.
+decay = 0.98
+# Score at/above which an alert fires. Default: 75.0.
+alert_threshold = 75.0
+# Small risk added per *sustained* Uncertain detection (scaled by confidence),
+# chosen << agent_detection_weight so a single Uncertain never alerts but a
+# session that keeps re-emitting Uncertain (dead-band camping) climbs over time.
+# Default: 6.0.
+uncertain_detection_weight = 6.0
+# Minimum confidence for an Uncertain detection to contribute any risk. Uncertain
+# confidence peaks in the middle of the dead band (where a camper sits), so this
+# concentrates the incremental risk on genuine campers. Default: 0.5.
+uncertain_min_confidence = 0.5

@@ -8,6 +8,7 @@
 //! degrades as an agent spends more effort mimicking a human. These curves are
 //! the empirical core of the paper's game-theoretic analysis.
 
+use crate::baseline::{make_dataset, LogisticRegression, TrainConfig};
 use crate::features::SessionAccumulator;
 use crate::model::Model;
 use crate::synth::{synth_session, ProfileParams, Rng};
@@ -139,6 +140,86 @@ fn safe_div(a: f64, b: f64) -> f64 {
     } else {
         a / b
     }
+}
+
+/// One row of the transparent-vs-learned head-to-head at a given evasion budget.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelComparison {
+    /// Evasion budget `e ∈ [0,1]` the agents in the test set spent mimicking a human.
+    pub evasion: f64,
+    /// ROC-AUC of the transparent [`Model`] on the shared held-out test set.
+    pub transparent_auc: f64,
+    /// ROC-AUC of the learned [`LogisticRegression`] baseline on the *same* set.
+    pub learned_auc: f64,
+}
+
+/// Train the learned baseline once on naive synthetic data, then score **both** the
+/// transparent model and the learned baseline on a shared, disjoint held-out test
+/// set at each evasion budget. Returns one [`ModelComparison`] per budget.
+///
+/// The procedure is engineered to be a fair, leak-free head-to-head:
+///
+/// 1. **Train once, on naive data.** The baseline is fit from `human()` vs `agent()`
+///    (evasion 0). Training on naive agents — not on the evaded test distribution —
+///    is the honest choice: the evader is adaptive and unknown at training time
+///    (mirroring [`evaluate_with_evasion`]), and it prevents the LR from trivially
+///    memorizing each evasion budget.
+/// 2. **Per budget `e`**, derive the evaded agent via the same `evade` lerp used by
+///    the rest of the harness, and build **one** held-out test set with a *distinct*
+///    seed so train/test draws are disjoint (no leakage from the training RNG stream).
+/// 3. **Score both models on that identical test set** with the shared
+///    [`roc_auc`] estimator — same rows, same labels, same AUC ⇒ apples-to-apples.
+///
+/// Both models see the identical evidenced population: under-evidenced sessions
+/// (`features() == None`) are dropped inside [`make_dataset`], exactly as
+/// [`evaluate_with_evasion`] drops them.
+pub fn compare_models_across_evasion(
+    n_train_per_class: usize,
+    n_test_per_class: usize,
+    seed: u64,
+    evasion_budgets: &[f64],
+) -> Vec<ModelComparison> {
+    // 1. Train the learned baseline once on naive (evasion-0) data.
+    let mut train_rng = Rng::new(seed);
+    let train = make_dataset(
+        &ProfileParams::agent(),
+        &ProfileParams::human(),
+        n_train_per_class,
+        &mut train_rng,
+    );
+    let lr = LogisticRegression::train(&train, &TrainConfig::default());
+
+    let transparent = Model::default();
+    let human = ProfileParams::human();
+
+    evasion_budgets
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| {
+            let e = e.clamp(0.0, 1.0);
+            let agent = evade(e);
+
+            // 2. One held-out test set per budget, with a seed disjoint from train.
+            //    The `0x7E57` ("TEST") salt + per-budget index keeps each test
+            //    draw disjoint from the training stream and from every other budget.
+            let mut test_rng = Rng::new(seed ^ 0x7E57_0000_u64.wrapping_add(i as u64));
+            let test = make_dataset(&agent, &human, n_test_per_class, &mut test_rng);
+
+            // 3. Score both models on the identical rows with the shared estimator.
+            let mut transparent_scored: Vec<(f64, bool)> = Vec::with_capacity(test.len());
+            let mut learned_scored: Vec<(f64, bool)> = Vec::with_capacity(test.len());
+            for (f, label) in &test {
+                transparent_scored.push((transparent.assess(f).p_agent, *label));
+                learned_scored.push((lr.predict_proba(f), *label));
+            }
+
+            ModelComparison {
+                evasion: e,
+                transparent_auc: roc_auc(&transparent_scored),
+                learned_auc: roc_auc(&learned_scored),
+            }
+        })
+        .collect()
 }
 
 /// ROC-AUC via the Mann–Whitney U statistic (rank method, ties averaged).
@@ -427,6 +508,69 @@ mod tests {
             100.0 * fpr,
             human_seq_agent,
             humans
+        );
+    }
+
+    #[test]
+    fn transparent_competitive_with_learned_baseline() {
+        // Head-to-head on a shared, disjoint held-out set at three evasion budgets.
+        // We assert the *honest, demonstrable* properties, NOT that one model beats
+        // the other (the learned model can overfit the synthetic generator, so a
+        // small edge for it is not evidence of field skill — see
+        // docs/model-comparison.md).
+        let rows = compare_models_across_evasion(600, 400, 12345, &[0.0, 0.5, 1.0]);
+        assert_eq!(rows.len(), 3);
+
+        // (a) Sanity: at zero evasion both models separate the classes well —
+        //     the learned baseline genuinely learned the separation, and the
+        //     transparent model's priors hold.
+        let naive = &rows[0];
+        assert!(
+            naive.transparent_auc > 0.9,
+            "transparent AUC at e=0 was {}",
+            naive.transparent_auc
+        );
+        assert!(
+            naive.learned_auc > 0.9,
+            "learned AUC at e=0 was {}",
+            naive.learned_auc
+        );
+
+        // (b) The two models are COMPARABLE at every budget: neither runs away
+        //     from the other. A 0.10 AUC band is generous given synth noise and
+        //     is symmetric (we do not privilege either model).
+        for r in &rows {
+            assert!(
+                (r.transparent_auc - r.learned_auc).abs() <= 0.10,
+                "models not comparable at e={}: transparent {} vs learned {}",
+                r.evasion,
+                r.transparent_auc,
+                r.learned_auc
+            );
+        }
+
+        // (c) The evasion story holds for BOTH models: a perfect behavioural mimic
+        //     (e=1.0) is much harder to detect than a naive agent (e=0.0), and both
+        //     collapse toward chance (~0.5). This is the central claim of the
+        //     evasion analysis, and it is not an artifact of the transparent model.
+        let mimic = &rows[2];
+        assert!(
+            naive.transparent_auc > mimic.transparent_auc,
+            "transparent: naive {} should exceed mimic {}",
+            naive.transparent_auc,
+            mimic.transparent_auc
+        );
+        assert!(
+            naive.learned_auc > mimic.learned_auc,
+            "learned: naive {} should exceed mimic {}",
+            naive.learned_auc,
+            mimic.learned_auc
+        );
+        assert!(
+            mimic.transparent_auc < 0.65 && mimic.learned_auc < 0.65,
+            "both models should approach chance at full mimicry: transparent {}, learned {}",
+            mimic.transparent_auc,
+            mimic.learned_auc
         );
     }
 }

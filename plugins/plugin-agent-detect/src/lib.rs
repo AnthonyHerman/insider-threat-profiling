@@ -8,6 +8,7 @@
 //! [`Detection`](aegis_sdk::EventPayload::Detection) verdict via the
 //! [transparent model](model).
 
+pub mod baseline;
 pub mod eval;
 pub mod features;
 pub mod model;

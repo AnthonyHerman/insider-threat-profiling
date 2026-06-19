@@ -88,7 +88,16 @@ cargo run --bin aegis-agent -- run --print-events
 # Build the self-contained, statically-linked server
 cargo build --release --bin aegisd --target x86_64-unknown-linux-musl
 ldd target/x86_64-unknown-linux-musl/release/aegisd   # => "statically linked"
+
+# ...or build the scratch container image carrying only that one binary
+docker build -t aegisd:0.1.0 .
 ```
+
+Start from the commented example configs when deploying:
+[`configs/agent.example.toml`](configs/agent.example.toml) and
+[`configs/server.example.toml`](configs/server.example.toml). For the
+tamper-resistant agent install (generated systemd units) and the authenticated
+root uninstall, see [`packaging/README.md`](packaging/README.md).
 
 ## Tamper resistance & ethics
 
@@ -105,15 +114,50 @@ section.
 
 ## Documentation
 
-- Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- Threat model & ethics: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)
-- Research paper: [`docs/paper/`](docs/paper/)
-- Blog post: [`docs/blog/`](docs/blog/)
+**Start here**
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the plugin kernel, event bus, discovery, and lifecycle.
+- [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) — what is defended, the attacker model, ethics, and the limits of tamper resistance.
+- [`docs/PLUGINS.md`](docs/PLUGINS.md) — the plugin catalog and how to author your own.
+
+**Design notes**
+- [`docs/detection-design.md`](docs/detection-design.md) — the agent-vs-human model: features, the transparent additive scorer, and calibration.
+- [`docs/server-design.md`](docs/server-design.md) — the self-contained server: ingest, embedded store, operator API, and dashboard.
+- [`docs/transport-design.md`](docs/transport-design.md) — the agent↔server wire protocol, pinned mutual TLS, enrollment, and the durable forwarder.
+
+**Operations**
+- [`docs/BUILD.md`](docs/BUILD.md) — building everything, plus the static musl server.
+- [`configs/agent.example.toml`](configs/agent.example.toml) · [`configs/server.example.toml`](configs/server.example.toml) — fully-commented example host configs.
+- [`Dockerfile`](Dockerfile) — scratch image carrying only the single `aegisd` binary.
+- [`packaging/README.md`](packaging/README.md) — the agent's self-installing systemd units and the authenticated root uninstall.
+
+**Assurance**
+- [`docs/security-audit.md`](docs/security-audit.md) — the full-workspace security audit and remediation status.
+- [`docs/perf.md`](docs/perf.md) — hot-path micro-benchmarks.
+- [`docs/linode-integration.md`](docs/linode-integration.md) — end-to-end validation on real hardware.
+
+**Project**
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution workflow and conventions.
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes.
+- [`docs/paper/paper.md`](docs/paper/paper.md) — the research paper.
+- [`docs/blog/blog.md`](docs/blog/blog.md) — the blog post.
 
 ## Status
 
-Active research prototype. CI builds, lints, tests every crate, and verifies the
-server links statically. See the design docs for the roadmap.
+**Implemented and live-validated.** All components are built end-to-end: the
+plugin kernel, the content-free collectors, the flagship agent-vs-human detector
+and risk scoring, the durable mutual-TLS transport with enrollment, the
+tamper-resistant agent installer, and the single self-contained `aegisd` server
+(embedded `redb` store + embedded dashboard). The full client/server pipeline —
+enrollment, mTLS forwarding, server-side detection — has been exercised on a real
+Linux host distinct from the build machine (see
+[`docs/linode-integration.md`](docs/linode-integration.md)).
+
+CI on every push/PR runs `rustfmt`, `clippy -D warnings`, and the workspace
+build + tests (`--locked`), and a dedicated job builds the static musl `aegisd`
+and asserts it is statically linked. A full security audit
+([`docs/security-audit.md`](docs/security-audit.md)) has been completed with
+findings remediated against source. This is research-grade software; see the
+threat model and design docs for scope, assumptions, and known limitations.
 
 ## License
 

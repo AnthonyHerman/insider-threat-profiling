@@ -1,0 +1,172 @@
+# =============================================================================
+# Aegis endpoint agent — example host configuration
+# =============================================================================
+#
+# This is a fully-commented example of the TOML consumed by `aegis-agent run
+# --config <file>` (parsed by `HostConfig::from_toml_file`, see
+# crates/aegis-core/src/config.rs). Every field shown here is OPTIONAL except
+# `agent_id`; the values below are the built-in defaults unless noted, so you
+# can delete any block you do not need to override.
+#
+# Per-plugin settings live under `[plugins."plugin-NAME"]` subtrees. The host
+# stores these as opaque JSON and hands each plugin its own subtree, which the
+# plugin deserializes into its config struct via `PluginContext::config_as`.
+# Plugins with all-`#[serde(default)]` fields (transport, tamper) accept a
+# partial subtree; the others fill their own `Default` when the subtree is
+# absent. Unknown keys in a subtree are ignored.
+#
+# IMPORTANT operational notes are called out inline with "NOTE:".
+# =============================================================================
+
+# Stable identity of this endpoint. REQUIRED.
+#
+# NOTE: when you enroll with the server (`aegis-agent enroll`), the server
+# assigns the operational agent_id (a UUID) and the forwarder reads it from
+# <data_dir>/plugin-transport/. This top-level `agent_id` is the host's local
+# identity used before/without enrollment (e.g. local `run`/`shell`). The CLI
+# `--agent-id` flag / AEGIS_AGENT_ID env var override it for `run`.
+agent_id = "agent-local"
+
+# Root directory for plugin state. Each plugin gets `data_dir/<plugin-name>`.
+# Default: "./data". The enrolled identity is written under
+# `<data_dir>/plugin-transport/`. For a hardened install this is /var/lib/aegis.
+#
+# NOTE: `aegis-agent run --data-dir <dir>` overrides this field at runtime.
+data_dir = "./data/agent"
+
+# Plugin load policy.
+#
+# `enabled_plugins`: if set, ONLY these plugins load (an allow-list). If omitted
+# (the default), every discovered plugin loads except those in
+# `disabled_plugins`. Leave unset to load all built-ins.
+# enabled_plugins = ["plugin-session", "plugin-process", "plugin-transport", "plugin-tamper"]
+
+# `disabled_plugins`: skip these even if discovered/enabled (a deny-list).
+disabled_plugins = []
+
+# Bounded per-plugin queue depth — the back-pressure point. When a plugin's
+# inbound queue is full the bus drops (and counts) the event rather than growing
+# unboundedly. Default: 4096.
+queue_depth = 4096
+
+# Dynamic (runtime-loaded cdylib) plugins. Each entry MUST carry both the
+# plugin's registered `name` and the `.so` `path`: the host evaluates the
+# enable/disable policy on `name` BEFORE opening the library (dlopen runs native
+# code), then asserts the library's reported name matches. The built-in agent
+# plugins are statically linked, so most deployments leave this empty.
+#
+# NOTE: there is currently no signature/integrity gate on dynamic `.so` files
+# (see docs/security-audit.md H5); only load shared objects you built and trust.
+# [[dynamic_plugins]]
+# name = "plugin-custom"
+# path = "/usr/local/lib/aegis/libplugin_custom.so"
+
+# =============================================================================
+# Per-plugin configuration
+# =============================================================================
+
+# --- plugin-session: session lifecycle + content-free command statistics ------
+# Primary source of the behavioral substrate the agent-vs-human detector
+# consumes. Never captures keystroke CONTENT — only timing, structure, and a
+# salted correlation hash.
+[plugins."plugin-session"]
+# Emit a SessionStart for the current login at startup (best-effort). Default: true.
+emit_current_login = true
+# Per-deployment salt for the command-correlation hash (content is never stored).
+#
+# NOTE: CHANGE THIS PER DEPLOYMENT. Set the SAME value here and in
+# `[plugins."plugin-tty"].hash_salt` (and `aegis-agent shell --hash-salt`) so
+# the per-command hashes correlate across collectors. Default: "aegis-default-salt".
+hash_salt = "CHANGE-ME-per-deployment-salt"
+
+# --- plugin-process: process-execution collector -------------------------------
+# Samples /proc and emits ProcessExec for newly-seen processes (PID + start-time
+# keyed, so PID reuse is handled). Process lineage is part of the behavioral
+# picture (automated agents spawn characteristic process trees).
+[plugins."plugin-process"]
+# Sampling interval in milliseconds. Default: 2000. Lower = finer-grained
+# (catches short-lived processes) at higher CPU cost.
+interval_ms = 2000
+# If true, only report processes owned by non-system uids (>= 1000) — i.e. focus
+# on interactive user activity and ignore system daemons. Default: false.
+interactive_uids_only = false
+
+# --- plugin-tty: interactive-shell behavioral telemetry (PTY) ------------------
+# Captures the same content-free substrate as plugin-session (keystroke timing +
+# per-command structural statistics) by instrumenting a real shell.
+#
+# NOTE: this plugin is INERT by default (`mode = "off"`) because "shell" mode
+# seizes the controlling terminal. Enable it deliberately. For ad-hoc use prefer
+# the dedicated `aegis-agent shell` subcommand, which drives the runtime directly.
+[plugins."plugin-tty"]
+# Operating mode: "off" (default, collect nothing) | "pipe" (read timestamped
+# input chunks from a fifo/file; used for CI/testing) | "shell" (run $SHELL in a
+# PTY and instrument it; real interactive use).
+mode = "off"
+# Path to the input fifo/file. REQUIRED when mode = "pipe"; ignored otherwise.
+# pipe_path = "/run/aegis/tty.pipe"
+# Per-deployment salt for the command-correlation hash. Default: "aegis-default-salt".
+#
+# NOTE: keep this identical to `[plugins."plugin-session"].hash_salt` so hashes
+# correlate across the two collectors.
+hash_salt = "CHANGE-ME-per-deployment-salt"
+
+# --- plugin-transport: the forwarder (agent -> server sink) --------------------
+# Batches telemetry and ships it to the server over pinned mutual TLS, with an
+# in-memory ring plus on-disk spill so events survive a server outage. All fields
+# are defaulted; a partial subtree is fine.
+[plugins."plugin-transport"]
+# Server URL ("https://host:port"; scheme optional, port defaults to 8443).
+#
+# NOTE: an http:// URL is REJECTED (the transport is always TLS). You normally
+# leave this EMPTY: `aegis-agent run --server <url>` injects the value into this
+# subtree at startup unless you pin one here. Set it only to hard-code a server
+# in the config file.
+server = ""
+# Batching: flush when this many events queue, OR the serialized batch reaches
+# this many bytes, OR this many ms elapse (bounds latency at low event rates).
+batch_max_events = 512        # default 512
+batch_max_bytes = 1048576     # default 1 MiB
+flush_interval_ms = 1000      # default 1000 ms
+# Durability buffers: in-memory ring capacity (events) and the on-disk spill cap
+# (bytes). Overflow spills to disk; beyond the disk cap the oldest event drops.
+ring_capacity = 50000         # default 50_000 events
+spill_max_bytes = 67108864    # default 64 MiB
+# How long to wait for a BatchAck before tearing the connection down and backing
+# off (the un-acked batch is retained and retried). Default 30_000 ms.
+ack_timeout_ms = 30000
+# Reconnect backoff floor/ceiling (full-jitter exponential), in ms.
+backoff_min_ms = 500          # default 500
+backoff_max_ms = 30000        # default 30_000
+# Liveness: send a Ping after this much idle time; drop the connection if nothing
+# is received from the server for this long.
+keepalive_ms = 15000          # default 15_000 ms
+keepalive_timeout_ms = 45000  # default 45_000 ms
+# Max batches awaiting acknowledgement at once. 1 (default) = strict FIFO delivery.
+max_in_flight = 1
+
+# --- plugin-tamper: endpoint self-protection -----------------------------------
+# Watches the agent's own protected files (immutable bit + existence, and content
+# when a manifest is present) and reports a posture self-check. The protected
+# asset is *visibility*: the monitored user must not silently disable monitoring.
+#
+# NOTE: for a HARDENED INSTALL you normally do NOT set `protected_paths` /
+# `manifest_path` here. When `aegis-agent run` executes as root (the deployed
+# posture, i.e. the systemd unit's ExecStart), it auto-injects the canonical
+# install layout — the binary plus both unit files, and the manifest written by
+# `aegis-agent install` — keeping the install-time and run-time views in lockstep.
+# Set the fields below only to override that layout, or for a non-root/custom run.
+[plugins."plugin-tamper"]
+# How often to verify protective posture, in seconds. Default: 15.
+check_interval_s = 15
+# Files whose disappearance/alteration constitutes tampering. Default: empty
+# (auto-filled from the install layout when running as root, as noted above).
+# The standard hardened-install set is the binary + both systemd units:
+# protected_paths = [
+#     "/usr/local/sbin/aegis-agent",
+#     "/etc/systemd/system/aegis-agent.service",
+#     "/etc/systemd/system/aegis-guardian.service",
+# ]
+# SHA-256 baseline manifest written at install time. When present, the loop
+# verifies file CONTENT (not just existence). Default: "/var/lib/aegis/manifest.json".
+# manifest_path = "/var/lib/aegis/manifest.json"
